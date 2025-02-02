@@ -5955,6 +5955,97 @@ inline ssize_t Stream::write(const std::string &s) {
 
 namespace detail {
 
+#ifndef _WIN32
+#define SOCKET_ERROR -1
+#endif
+
+inline bool socketpair_inet(int fds[2]) {
+  fds[0] = fds[1] = INVALID_SOCKET;
+
+  socket_t lsock = INVALID_SOCKET, ssock = INVALID_SOCKET,
+           csock = INVALID_SOCKET;
+
+  auto se = detail::scope_exit([&]() {
+    if (lsock != INVALID_SOCKET) { close_socket(lsock); }
+    if (ssock != INVALID_SOCKET) { close_socket(ssock); }
+    if (csock != INVALID_SOCKET) { close_socket(csock); }
+  });
+
+  lsock = ::socket(AF_INET, SOCK_STREAM, 0);
+  csock = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (lsock == INVALID_SOCKET || csock == INVALID_SOCKET) { return false; }
+
+  int opt = 1;
+  if (::setsockopt(lsock, SOL_SOCKET,
+#if defined(_WIN32) || !defined(SO_REUSEPORT)
+                   SO_REUSEADDR,
+#else
+                   SO_REUSEPORT,
+#endif
+                   &opt, sizeof(opt)) == SOCKET_ERROR) {
+    return false;
+  }
+
+  struct sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+
+  if (::bind(lsock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) ==
+      SOCKET_ERROR) {
+    return false;
+  }
+  if (::listen(lsock, 1) == SOCKET_ERROR) { return false; }
+
+  socklen_t addrlen = sizeof(addr);
+  if (::getsockname(lsock, reinterpret_cast<struct sockaddr *>(&addr),
+                    &addrlen) == SOCKET_ERROR) {
+    return false;
+  }
+  if (::connect(csock, reinterpret_cast<struct sockaddr *>(&addr),
+                sizeof(addr)) == SOCKET_ERROR) {
+    return false;
+  }
+  ssock = ::accept(lsock, NULL, NULL);
+
+  // Pedantic check against CVEs like CVE-2024-3219
+  auto auth_connection = [](socket_t sock, socket_t peer) -> bool {
+    struct sockaddr_in sock_addr;
+    struct sockaddr_in peer_addr;
+    socklen_t sock_addrlen = sizeof(sock_addr);
+    socklen_t peer_addrlen = sizeof(peer_addr);
+
+    if (::getsockname(sock, reinterpret_cast<struct sockaddr *>(&sock_addr),
+                      &sock_addrlen) == SOCKET_ERROR) {
+      return false;
+    }
+    if (::getpeername(peer, reinterpret_cast<struct sockaddr *>(&peer_addr),
+                      &peer_addrlen) == SOCKET_ERROR) {
+      return false;
+    }
+
+    if (sock_addrlen != peer_addrlen) { return false; }
+    return std::memcmp(&sock_addr, &peer_addr, sock_addrlen) == 0;
+  };
+
+  if (!auth_connection(ssock, csock) || !auth_connection(csock, ssock)) {
+    return false;
+  }
+
+  set_nonblocking(ssock, true);
+  set_nonblocking(csock, true);
+  fds[0] = csock;
+  fds[1] = ssock;
+  ssock = INVALID_SOCKET; // Prevent closing on scope exit
+  csock = INVALID_SOCKET;
+
+  return true;
+}
+
+#ifndef _WIN32
+#undef SOCKET_ERROR
+#endif
+
 // Socket stream implementation
 inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
                                   time_t read_timeout_usec,
