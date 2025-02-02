@@ -6046,6 +6046,24 @@ inline bool socketpair_inet(int fds[2]) {
 #undef SOCKET_ERROR
 #endif
 
+inline bool pipe(int fds[2]) {
+  fds[0] = fds[1] = INVALID_SOCKET;
+
+#if defined(__linux__) && defined(_GNU_SOURCE)
+  if (::pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) { return false; }
+#elif !defined(_WIN32)
+  if (::pipe(fds) < 0) { return false; }
+  if (::fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0) { return false; }
+  if (::fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0) { return false; }
+  if (::fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) { return false; }
+  if (::fcntl(fds[1], F_SETFL, O_NONBLOCK) < 0) { return false; }
+#else
+  return false;
+#endif
+
+  return true;
+}
+
 // Socket stream implementation
 inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
                                   time_t read_timeout_usec,
