@@ -769,6 +769,28 @@ private:
   int fds_[2];
 };
 
+class NotifiableStream final : public Stream {
+public:
+  NotifiableStream(Stream &strm);
+  ~NotifiableStream() override;
+
+  bool is_readable() const override;
+  bool is_readable_or_notified(bool &readable, bool &notified) const;
+  bool is_writable() const override;
+
+  ssize_t read(char *ptr, size_t size) override;
+  ssize_t write(const char *ptr, size_t size) override;
+  void get_remote_ip_and_port(std::string &ip, int &port) const override;
+  void get_local_ip_and_port(std::string &ip, int &port) const override;
+  socket_t socket() const override;
+  void get_read_timeout(time_t &sec, time_t &usec) const override;
+  const NotifyHandle &notify_handle() const;
+
+private:
+  Stream *strm_ = nullptr;
+  NotifyHandle nh_{};
+};
+
 class TaskQueue {
 public:
   TaskQueue() = default;
@@ -6205,6 +6227,56 @@ inline void NotifyHandle::destroy() {
 #endif
 
   fds_[0] = fds_[1] = INVALID_SOCKET;
+}
+
+// Notifiable stream  implementation
+inline NotifiableStream::NotifiableStream(Stream &strm) : strm_(&strm) {}
+
+inline NotifiableStream::~NotifiableStream() = default;
+
+inline bool NotifiableStream::is_readable() const {
+  return strm_->is_readable();
+}
+
+inline bool NotifiableStream::is_readable_or_notified(bool &readable,
+                                                      bool &notified) const {
+  time_t timeout_sec, timeout_usec;
+  strm_->get_read_timeout(timeout_sec, timeout_usec);
+  return detail::select_read(strm_->socket(), nh_.fd(), timeout_sec,
+                             timeout_usec, readable, notified);
+}
+
+inline bool NotifiableStream::is_writable() const {
+  return strm_->is_writable();
+}
+
+inline ssize_t NotifiableStream::read(char *ptr, size_t size) {
+  return strm_->read(ptr, size);
+}
+
+inline ssize_t NotifiableStream::write(const char *ptr, size_t size) {
+  return strm_->write(ptr, size);
+}
+
+inline void NotifiableStream::get_remote_ip_and_port(std::string &ip,
+                                                     int &port) const {
+  strm_->get_remote_ip_and_port(ip, port);
+}
+
+inline void NotifiableStream::get_local_ip_and_port(std::string &ip,
+                                                    int &port) const {
+  strm_->get_local_ip_and_port(ip, port);
+}
+
+inline socket_t NotifiableStream::socket() const { return strm_->socket(); }
+
+inline void NotifiableStream::get_read_timeout(time_t &sec,
+                                               time_t &usec) const {
+  strm_->get_read_timeout(sec, usec);
+}
+
+inline const NotifyHandle &NotifiableStream::notify_handle() const {
+  return nh_;
 }
 
 namespace detail {
