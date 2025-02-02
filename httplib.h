@@ -517,6 +517,9 @@ using Progress = std::function<bool(uint64_t current, uint64_t total)>;
 struct Response;
 using ResponseHandler = std::function<bool(const Response &response)>;
 
+class Stream;
+using StreamHandler = std::function<bool(Stream &strm)>;
+
 struct MultipartFormData {
   std::string name;
   std::string content;
@@ -634,6 +637,7 @@ struct Request {
 
   // for client
   ResponseHandler response_handler;
+  StreamHandler stream_handler;
   ContentReceiverWithProgress content_receiver;
   Progress progress;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -8065,10 +8069,23 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
                     res.status != StatusCode::NotModified_304 &&
                     follow_location_;
 
-    if (req.response_handler && !redirect) {
-      if (!req.response_handler(res)) {
-        error = Error::Canceled;
-        return false;
+    if (!redirect) {
+      if (req.response_handler) {
+        if (!req.response_handler(res)) {
+          error = Error::Canceled;
+          return false;
+        }
+      }
+
+      if (req.stream_handler) {
+        // Log
+        if (logger_) { logger_(req, res); }
+
+        if (!req.stream_handler(strm)) {
+          error = Error::Canceled;
+          return false;
+        }
+        return true;
       }
     }
 
