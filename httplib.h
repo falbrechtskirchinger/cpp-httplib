@@ -745,6 +745,29 @@ public:
   ssize_t write(const std::string &s);
 };
 
+class NotifyHandle {
+public:
+  NotifyHandle();
+  NotifyHandle(const NotifyHandle &) = delete;
+  NotifyHandle(NotifyHandle &&) noexcept;
+  ~NotifyHandle();
+
+  NotifyHandle &operator=(const NotifyHandle &) = delete;
+  NotifyHandle &operator=(NotifyHandle &&) noexcept;
+
+  bool is_valid() const;
+
+  int fd() const;
+
+  bool notify() const;
+  bool clear() const;
+
+  void destroy();
+
+private:
+  int fds_[2];
+};
+
 class TaskQueue {
 public:
   TaskQueue() = default;
@@ -6105,6 +6128,79 @@ inline bool pipe(int fds[2]) {
 
   return true;
 }
+
+} // namespace detail
+
+// NotifyHandle implementation
+inline NotifyHandle::NotifyHandle() {
+#ifdef _WIN32
+  detail::socketpair_inet(fds_);
+#else
+  detail::pipe(fds_);
+#endif
+}
+
+inline NotifyHandle::NotifyHandle(NotifyHandle &&other) noexcept {
+  std::memcpy(fds_, other.fds_, sizeof(fds_));
+  other.fds_[0] = other.fds_[1] = INVALID_SOCKET;
+}
+
+inline NotifyHandle::~NotifyHandle() { destroy(); }
+
+inline NotifyHandle &NotifyHandle::operator=(NotifyHandle &&other) noexcept {
+  if (this != &other) {
+    destroy();
+    std::memcpy(fds_, other.fds_, sizeof(fds_));
+    other.fds_[0] = other.fds_[1] = INVALID_SOCKET;
+  }
+  return *this;
+}
+
+inline bool NotifyHandle::is_valid() const {
+  return fds_[0] != INVALID_SOCKET && fds_[1] != INVALID_SOCKET;
+}
+
+inline int NotifyHandle::fd() const { return fds_[0]; }
+
+inline bool NotifyHandle::notify() const {
+  const char buf[1]{};
+#ifdef _WIN32
+  return detail::send_socket(fds_[1], buf, sizeof(buf)) == sizeof(buf);
+#else
+  return detail::handle_EINTR([&]() {
+           return ::write(fds_[1], buf, sizeof(buf));
+         }) == sizeof(buf);
+#endif
+}
+
+inline bool NotifyHandle::clear() const {
+  char buf[1]{};
+#ifdef _WIN32
+  return detail::read_socket(fds_[0], buf, sizeof(buf)) == sizeof(buf);
+#else
+  return detail::handle_EINTR([&]() {
+           return ::read(fds_[0], buf, sizeof(buf));
+         }) == sizeof(buf);
+#endif
+}
+
+inline void NotifyHandle::destroy() {
+#ifdef _WIN32
+  if (fds_[0] != INVALID_SOCKET) { detail::close_socket(fds_[0]); }
+  if (fds_[1] != INVALID_SOCKET) { detail::close_socket(fds_[1]); }
+#else
+  if (fds_[0] != INVALID_SOCKET) {
+    detail::handle_EINTR([&]() { return ::close(fds_[0]); });
+  }
+  if (fds_[1] != INVALID_SOCKET) {
+    detail::handle_EINTR([&]() { return ::close(fds_[1]); });
+  }
+#endif
+
+  fds_[0] = fds_[1] = INVALID_SOCKET;
+}
+
+namespace detail {
 
 // Socket stream implementation
 inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
