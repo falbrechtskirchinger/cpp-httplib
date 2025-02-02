@@ -740,6 +740,7 @@ public:
   virtual void get_remote_ip_and_port(std::string &ip, int &port) const = 0;
   virtual void get_local_ip_and_port(std::string &ip, int &port) const = 0;
   virtual socket_t socket() const = 0;
+  virtual void get_read_timeout(time_t &sec, time_t &usec) const;
 
   ssize_t write(const char *ptr);
   ssize_t write(const std::string &s);
@@ -3379,6 +3380,7 @@ public:
   void get_remote_ip_and_port(std::string &ip, int &port) const override;
   void get_local_ip_and_port(std::string &ip, int &port) const override;
   socket_t socket() const override;
+  void get_read_timeout(time_t &sec, time_t &usec) const override;
 
 private:
   socket_t sock_;
@@ -3409,6 +3411,7 @@ public:
   void get_remote_ip_and_port(std::string &ip, int &port) const override;
   void get_local_ip_and_port(std::string &ip, int &port) const override;
   socket_t socket() const override;
+  void get_read_timeout(time_t &sec, time_t &usec) const override;
 
 private:
   socket_t sock_;
@@ -6010,6 +6013,10 @@ Result::get_request_header_value_count(const std::string &key) const {
 }
 
 // Stream implementation
+inline void Stream::get_read_timeout(time_t &sec, time_t &usec) const {
+  sec = usec = 0;
+}
+
 inline ssize_t Stream::write(const char *ptr) {
   return write(ptr, strlen(ptr));
 }
@@ -6291,6 +6298,11 @@ inline void SocketStream::get_local_ip_and_port(std::string &ip,
 }
 
 inline socket_t SocketStream::socket() const { return sock_; }
+
+inline void SocketStream::get_read_timeout(time_t &sec, time_t &usec) const {
+  sec = read_timeout_sec_;
+  usec = read_timeout_usec_;
+}
 
 // Buffer stream implementation
 inline bool BufferStream::is_readable() const { return true; }
@@ -9441,6 +9453,11 @@ inline void SSLSocketStream::get_local_ip_and_port(std::string &ip,
 }
 
 inline socket_t SSLSocketStream::socket() const { return sock_; }
+
+inline void SSLSocketStream::get_read_timeout(time_t &sec, time_t &usec) const {
+  sec = read_timeout_sec_;
+  usec = read_timeout_usec_;
+}
 
 static SSLInit sslinit_;
 
