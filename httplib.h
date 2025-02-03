@@ -659,6 +659,7 @@ struct Request {
 
   // for client
   ResponseHandler response_handler;
+  StreamHandler stream_handler; // EXPERIMENTAL function signature may change
   ContentReceiverWithProgress content_receiver;
   Progress progress;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -1192,6 +1193,7 @@ enum class Error {
   Compression,
   ConnectionTimeout,
   ProxyConnection,
+  StreamHandler,
 
   // For internal use only
   SSLPeerCouldBeClosed_,
@@ -2282,6 +2284,7 @@ inline std::string to_string(const Error error) {
   case Error::Compression: return "Compression failed";
   case Error::ConnectionTimeout: return "Connection timed out";
   case Error::ProxyConnection: return "Proxy connection failed";
+  case Error::StreamHandler: return "Stream handler failed";
   case Error::Unknown: return "Unknown";
   default: break;
   }
@@ -7889,10 +7892,12 @@ inline bool ClientImpl::write_request(Stream &strm, Request &req,
     }
   }
 
-  if (!req.has_header("Accept")) { req.set_header("Accept", "*/*"); }
+  if (!req.stream_handler && !req.has_header("Accept")) {
+    req.set_header("Accept", "*/*");
+  }
 
   if (!req.content_receiver) {
-    if (!req.has_header("Accept-Encoding")) {
+    if (!req.stream_handler && !req.has_header("Accept-Encoding")) {
       std::string accept_encoding;
 #ifdef CPPHTTPLIB_BROTLI_SUPPORT
       accept_encoding = "br";
@@ -7910,7 +7915,7 @@ inline bool ClientImpl::write_request(Stream &strm, Request &req,
       req.set_header("User-Agent", agent);
     }
 #endif
-  };
+  }
 
   if (req.body.empty()) {
     if (req.content_provider_) {
@@ -8142,10 +8147,23 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
                     res.status != StatusCode::NotModified_304 &&
                     follow_location_;
 
-    if (req.response_handler && !redirect) {
-      if (!req.response_handler(res)) {
-        error = Error::Canceled;
-        return false;
+    if (!redirect) {
+      if (req.response_handler) {
+        if (!req.response_handler(res)) {
+          error = Error::Canceled;
+          return false;
+        }
+      }
+
+      if (req.stream_handler) {
+        // Log early
+        if (logger_) { logger_(req, res); }
+
+        if (!req.stream_handler(strm)) {
+          error = Error::StreamHandler;
+          return false;
+        }
+        return true;
       }
     }
 
