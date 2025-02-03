@@ -741,6 +741,9 @@ public:
   virtual void get_local_ip_and_port(std::string &ip, int &port) const = 0;
   virtual socket_t socket() const = 0;
 
+  virtual void set_read_timeout(time_t sec, time_t usec) = 0;
+  virtual void set_write_timeout(time_t sec, time_t usec) = 0;
+
   ssize_t write(const char *ptr);
   ssize_t write(const std::string &s);
 };
@@ -2390,6 +2393,9 @@ public:
   void get_local_ip_and_port(std::string &ip, int &port) const override;
   socket_t socket() const override;
 
+  void set_read_timeout(time_t sec, time_t usec) override;
+  void set_write_timeout(time_t sec, time_t usec) override;
+
   const std::string &get_buffer() const;
 
 private:
@@ -3317,6 +3323,9 @@ public:
   void get_local_ip_and_port(std::string &ip, int &port) const override;
   socket_t socket() const override;
 
+  void set_read_timeout(time_t sec, time_t usec) override;
+  void set_write_timeout(time_t sec, time_t usec) override;
+
 private:
   socket_t sock_;
   time_t read_timeout_sec_;
@@ -3346,6 +3355,9 @@ public:
   void get_remote_ip_and_port(std::string &ip, int &port) const override;
   void get_local_ip_and_port(std::string &ip, int &port) const override;
   socket_t socket() const override;
+
+  void set_read_timeout(time_t sec, time_t usec) override;
+  void set_write_timeout(time_t sec, time_t usec) override;
 
 private:
   socket_t sock_;
@@ -6046,6 +6058,16 @@ inline void SocketStream::get_local_ip_and_port(std::string &ip,
 
 inline socket_t SocketStream::socket() const { return sock_; }
 
+inline void SocketStream::set_read_timeout(time_t sec, time_t usec) {
+  read_timeout_sec_ = sec;
+  read_timeout_usec_ = usec;
+}
+
+inline void SocketStream::set_write_timeout(time_t sec, time_t usec) {
+  read_timeout_sec_ = sec;
+  write_timeout_usec_ = usec;
+}
+
 // Buffer stream implementation
 inline bool BufferStream::is_readable() const { return true; }
 
@@ -6073,6 +6095,10 @@ inline void BufferStream::get_local_ip_and_port(std::string & /*ip*/,
                                                 int & /*port*/) const {}
 
 inline socket_t BufferStream::socket() const { return 0; }
+
+inline void BufferStream::set_read_timeout(time_t /*sec*/, time_t /*usec*/) {}
+
+inline void BufferStream::set_write_timeout(time_t /*sec*/, time_t /*usec*/) {}
 
 inline const std::string &BufferStream::get_buffer() const { return buffer; }
 
@@ -9195,6 +9221,16 @@ inline void SSLSocketStream::get_local_ip_and_port(std::string &ip,
 }
 
 inline socket_t SSLSocketStream::socket() const { return sock_; }
+
+inline void SSLSocketStream::set_read_timeout(time_t sec, time_t usec) {
+  read_timeout_sec_ = sec;
+  read_timeout_usec_ = usec;
+}
+
+inline void SSLSocketStream::set_write_timeout(time_t sec, time_t usec) {
+  read_timeout_sec_ = sec;
+  write_timeout_usec_ = usec;
+}
 
 static SSLInit sslinit_;
 
