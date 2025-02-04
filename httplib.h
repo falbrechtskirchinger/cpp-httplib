@@ -6631,9 +6631,9 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
     need_apply_ranges = true;
   }
 
+  std::string content_type;
+  std::string boundary;
   if (!res.stream_handler_) {
-    std::string content_type;
-    std::string boundary;
     if (need_apply_ranges) { apply_ranges(req, res, content_type, boundary); }
 
     // Prepare additional headers
