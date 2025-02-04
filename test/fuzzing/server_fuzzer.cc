@@ -39,6 +39,10 @@ public:
 
   socket_t socket() const override { return 0; }
 
+  void set_read_timeout(time_t /*sec*/, time_t /*usec*/) override {}
+
+  void set_write_timeout(time_t /*sec*/, time_t /*usec*/) override {}
+
 private:
   const uint8_t *data_;
   size_t size_;
