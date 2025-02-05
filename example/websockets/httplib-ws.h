@@ -87,6 +87,35 @@ inline std::string to_string(WSCloseCode close_code) {
 
 namespace detail {
 
+inline namespace ws {
+
+namespace WSProto {
+
+enum Mask : uint8_t {
+  Header0_IsFinal /*         */ = 0b10000000,
+  Header0_Reserved /*        */ = 0b01110000,
+  Header0_OpCode /*          */ = 0b00001111,
+  Header0_OpCode_IsControl /**/ = 0b00001000,
+  Header1_IsMasked /*        */ = 0b10000000,
+  Header1_PayloadLength /*   */ = 0b01111111,
+};
+
+enum OpCode : uint8_t {
+  OpCode_None = 0x00,
+  OpCode_Continuation = 0x00,
+  OpCode_Text = 0x01,
+  OpCode_Binary = 0x02,
+  OpCode_Close = 0x08,
+  OpCode_Ping = 0x09,
+  OpCode_Pong = 0x0a,
+};
+
+} // namespace WSProto
+
+using WSFrameHeader = uint8_t[2];
+
+} // namespace ws
+
 inline bool pipe(socket_t fds[2]) {
   fds[0] = fds[1] = INVALID_SOCKET;
 
@@ -267,6 +296,303 @@ inline void NotifyHandle::destroy() {
 #endif
 
   fds_[0] = fds_[1] = INVALID_SOCKET;
+}
+
+inline namespace ws {
+
+enum class WSReadResult {
+  Error,
+  Again,
+  Stop,
+};
+
+using WSFrameHeader = uint8_t[2];
+
+} // namespace ws
+
+enum class WSReadState {
+  NewFrame,
+  NewFrameResume, // Resume fragmented message after having reveived a control
+                  // frame
+  NewFrameContinuation,
+  Header,
+  PayloadLength16,
+  PayloadLength64,
+  Mask,
+  Payload,
+};
+
+struct WSFrame {
+  WSReadState read_state;
+  WSFrameHeader header;
+  uint8_t opcode;
+  bool is_final;
+  bool is_masked;
+  bool is_complete;
+  uint8_t mask[4];
+  uint64_t payload_length;
+  std::string payload;
+};
+
+class WSReader {
+public:
+  WSReader(Stream &strm, bool expect_masked);
+
+  WSReadResult read(bool readable);
+
+  WSCloseCode close_code() const;
+
+  WSFrame &current_frame();
+
+  bool is_closing_await_recv() const;
+  void is_closing_await_recv(bool is_closing);
+
+  bool is_closing_await_send() const;
+  void is_closing_await_send(bool is_closing);
+
+private:
+  bool read_next_bytes(bool readable, char *buf_ptr);
+  bool handle_payload_length();
+
+  Stream *strm_;
+  WSFrame storage_[2]{};
+  WSFrame *frame_;  // Two frames to support control frames
+  WSFrame *frame2_; // in the middle of fragmented messages
+
+  char buffer_[sizeof(uint64_t)];
+
+  size_t read_offset_;
+  size_t read_length_;
+  size_t saved_read_offset_; // Used to save payload length/offset
+  size_t saved_read_length_; // when reading mask before payload
+
+  WSCloseCode close_code_ = WSCloseCode::NoStatusRcvd_1005;
+  bool expect_masked_;
+  bool read_complete_;
+  bool is_closing_await_recv_ = false; // Whether we sent a close frame and
+                                       // are waiting for our peer to respond
+  bool is_closing_await_send_ = false; // Whether we received a close frame
+                                       // and still have to respond
+};
+
+// WSReader implementation
+WSReader::WSReader(Stream &strm, bool expect_masked)
+    : strm_(&strm), frame_(&storage_[0]), frame2_(&storage_[1]),
+      expect_masked_(expect_masked) {}
+
+WSReadResult WSReader::read(bool readable) {
+  using namespace ws;
+
+  switch (frame_->read_state) {
+  case WSReadState::NewFrame:
+  case WSReadState::NewFrameResume:
+    if (frame_->read_state == WSReadState::NewFrame) {
+      frame_->opcode = WSProto::OpCode_None;
+      frame_->is_complete = false;
+      frame_->payload.clear();
+    } else {
+      // A fragmented message was interrupted by a control frame
+      // Reset opcode on current/control frame, keep opcode on new frame for
+      // continuation
+      frame_->opcode = WSProto::OpCode_None;
+      std::swap(frame_, frame2_);
+    }
+    // Fallthrough
+  case WSReadState::NewFrameContinuation:
+    read_offset_ = 0;
+    read_length_ = sizeof(frame_->header);
+  // Fallthrough
+  case WSReadState::Header:
+    if (!read_next_bytes(readable, buffer_)) { return WSReadResult::Error; }
+    if (read_complete_) {
+      WSFrameHeader header;
+      std::memcpy(header, buffer_, sizeof(header));
+
+      // Reserved bits MUST be zero
+      if (header[0] & WSProto::Header0_Reserved) {
+        close_code_ = WSCloseCode::ProtocolError_1002;
+        return WSReadResult::Error;
+      }
+
+      // Is this a control frame interrupting a fragmented message?
+      if (frame_->opcode != WSProto::OpCode_None &&
+          header[0] & WSProto::Header0_OpCode_IsControl) {
+        // Keep current opcode for continuation, reset opcode on new frame
+        std::swap(frame_, frame2_);
+        frame_->opcode = WSProto::OpCode_None;
+      }
+
+      std::memcpy(frame_->header, header, sizeof(header));
+      frame_->is_final = frame_->header[0] & WSProto::Header0_IsFinal;
+
+      // Validate opcode
+      uint8_t opcode = frame_->header[0] & WSProto::Header0_OpCode;
+      if (opcode == WSProto::OpCode_Continuation) {
+        if (frame_->opcode == WSProto::OpCode_Continuation) {
+          // Nothing to continue
+          close_code_ = WSCloseCode::ProtocolError_1002;
+          return WSReadResult::Error;
+        }
+      } else {
+        frame_->opcode = opcode;
+      }
+
+      frame_->is_masked = frame_->header[1] & WSProto::Header1_IsMasked;
+      frame_->payload_length =
+          frame_->header[1] & WSProto::Header1_PayloadLength;
+
+      // Control frames MUST NOT be fragmented
+      if (frame_->opcode & WSProto::Header0_OpCode_IsControl &&
+          !frame_->is_final) {
+        close_code_ = WSCloseCode::ProtocolError_1002;
+        return WSReadResult::Error;
+      }
+
+      // Frames from server to client MUST NOT be masked
+      if (frame_->is_masked != expect_masked_) {
+        close_code_ = WSCloseCode::ProtocolError_1002;
+        return WSReadResult::Error;
+      }
+
+      // Select next state
+      read_offset_ = 0;
+      if (frame_->payload_length == 126) {
+        read_length_ = sizeof(uint16_t);
+        frame_->read_state = WSReadState::PayloadLength16;
+      } else if (frame_->payload_length == 127) {
+        read_length_ = sizeof(uint64_t);
+        frame_->read_state = WSReadState::PayloadLength64;
+      } else if (!handle_payload_length()) {
+        return WSReadResult::Error;
+      }
+    }
+    break;
+  case WSReadState::PayloadLength16:
+    if (!read_next_bytes(readable, buffer_)) { return WSReadResult::Error; }
+    if (read_complete_) {
+      uint16_t payload_length;
+      std::memcpy(&payload_length, buffer_, sizeof(payload_length));
+      frame_->payload_length = ::ntohs(payload_length);
+      if (!handle_payload_length()) { return WSReadResult::Error; }
+    }
+    break;
+  case WSReadState::PayloadLength64:
+    if (!read_next_bytes(readable, buffer_)) { return WSReadResult::Error; }
+    if (read_complete_) {
+      frame_->payload_length = std::accumulate(
+          buffer_, buffer_ + sizeof(frame_->payload_length),
+          static_cast<uint64_t>(0), [](uint64_t len, char b) {
+            return (len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(b));
+          });
+      if (!handle_payload_length()) { return WSReadResult::Error; }
+    }
+    break;
+  case WSReadState::Mask:
+    if (!read_next_bytes(readable, buffer_)) { return WSReadResult::Error; }
+    if (read_complete_) {
+      std::memcpy(frame_->mask, buffer_, sizeof(frame_->mask));
+      // Select next state
+      read_offset_ = saved_read_offset_;
+      read_length_ = saved_read_length_;
+      frame_->read_state = WSReadState::Payload;
+    }
+    break;
+  case WSReadState::Payload:
+    if (!read_next_bytes(readable, &frame_->payload[0])) {
+      return WSReadResult::Error;
+    }
+    if (read_complete_) {
+      // Select next state
+      if (frame_->is_final) {
+        frame_->is_complete = true;
+
+        // Did a control frame interrupt a fragmented message?
+        if (frame_->opcode & WSProto::Header0_OpCode_IsControl &&
+            frame2_->opcode != WSProto::OpCode_None) {
+          frame_->read_state = WSReadState::NewFrameResume;
+        } else {
+          frame_->read_state = WSReadState::NewFrame;
+        }
+      } else {
+        frame_->read_state = WSReadState::NewFrameContinuation;
+      }
+    }
+    break;
+  default:
+    assert(false); // Should never happen
+    return WSReadResult::Error;
+  }
+
+  // If a read was fully satisfied, but didn't yield a complete message, try
+  // reading again
+  return (read_complete_ && !frame_->is_complete) ? WSReadResult::Again
+                                                  : WSReadResult::Stop;
+}
+
+inline WSCloseCode WSReader::close_code() const { return close_code_; }
+
+inline WSFrame &WSReader::current_frame() { return *frame_; }
+
+inline bool WSReader::is_closing_await_recv() const {
+  return is_closing_await_recv_;
+}
+
+inline void WSReader::is_closing_await_recv(bool is_closing) {
+  is_closing_await_recv_ = is_closing;
+}
+
+inline bool WSReader::is_closing_await_send() const {
+  return is_closing_await_send_;
+}
+
+inline void WSReader::is_closing_await_send(bool is_closing) {
+  is_closing_await_send_ = is_closing;
+}
+
+inline bool WSReader::read_next_bytes(bool readable, char *buf_ptr) {
+  size_t read_length =
+      readable ? read_length_
+               : (std::min)(read_length_, strm_->nonblocking_read_size());
+  ssize_t n = strm_->read(buf_ptr + read_offset_, read_length);
+  if (n <= 0) { // Read failed
+    close_code_ = WSCloseCode::AbnormalClosure_1006;
+    return false;
+  }
+
+  read_offset_ += n;
+  read_length_ -= n;
+  read_complete_ = read_length_ == 0;
+
+  return true;
+}
+
+inline bool WSReader::handle_payload_length() {
+  size_t total_length =
+      frame_->payload.size() + static_cast<size_t>(frame_->payload_length);
+  if ((frame_->payload_length & (1ULL << 63)) || // MSB MUST be zero
+      frame_->payload_length > (std::numeric_limits<size_t>::max)() ||
+      total_length < frame_->payload.size() || // Check overflow
+      total_length > frame_->payload.max_size() ||
+      frame_->payload_length > CPPHTTPLIB_PAYLOAD_MAX_LENGTH) {
+    close_code_ = WSCloseCode::MessageTooBig_1009;
+    return false;
+  }
+
+  // Select next state
+  saved_read_offset_ = frame_->payload.size();
+  saved_read_length_ = static_cast<size_t>(frame_->payload_length);
+  frame_->payload.resize(total_length);
+  if (frame_->is_masked) {
+    read_offset_ = 0;
+    read_length_ = sizeof(frame_->mask);
+    frame_->read_state = WSReadState::Mask;
+  } else {
+    read_offset_ = saved_read_offset_;
+    read_length_ = saved_read_length_;
+    frame_->read_state = WSReadState::Payload;
+  }
+
+  return true;
 }
 
 } // namespace detail
