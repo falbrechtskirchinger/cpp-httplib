@@ -65,6 +65,8 @@ enum class WSMessageType {
 using WSMessageHandler =
     std::function<void(std::string msg, WSMessageType msg_type)>;
 
+using WSSubprotocols = std::vector<std::string>;
+
 enum class WSPingAction {
   Ignore,
   AutoReply = 0b01,   // Echo data back as Pong
@@ -168,6 +170,45 @@ protected:
 };
 
 } // namespace detail
+
+class WebSocketClient : public detail::WSConnectionBase<false> {
+public:
+  // Universal interface
+  explicit WebSocketClient(const std::string &scheme_host_port);
+
+  explicit WebSocketClient(const std::string &scheme_host_port,
+                           const std::string &client_cert_path,
+                           const std::string &client_key_path);
+
+  // WS only interface
+  explicit WebSocketClient(const std::string &host, int port);
+
+  explicit WebSocketClient(const std::string &host, int port,
+                           const std::string &client_cert_path,
+                           const std::string &client_key_path);
+
+  WebSocketClient(WebSocketClient &&) = default;
+  WebSocketClient &operator=(WebSocketClient &&) = default;
+
+  ~WebSocketClient();
+
+  bool is_valid() const;
+
+  bool connect(const std::string &path, WSMessageHandler message_handler);
+  bool connect(const std::string &path, const Headers &headers,
+               const WSSubprotocols &subprotocols,
+               WSMessageHandler message_handler);
+
+private:
+  bool validate_response(const Response &res, const std::string &ws_key,
+                         const WSSubprotocols &subprotocols);
+
+  std::unique_ptr<ClientImpl> cli_;
+
+  std::thread thread_;
+
+  bool is_ssl_ = false;
+};
 
 // ----------------------------------------------------------------------------
 
@@ -403,6 +444,24 @@ inline bool write_msg(Stream &strm, WSMessage &msg, bool mask_payload) {
   // Mask payload if requested and send it
   if (mask_payload) { apply_mask(mask, msg.payload); }
   return write_data(strm, msg.payload.data(), msg.payload.size());
+}
+
+inline std::string make_ws_accept(const std::string &ws_key) {
+  constexpr const char *ws_accept_magic =
+      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  auto context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(
+      EVP_MD_CTX_new(), EVP_MD_CTX_free);
+
+  unsigned int hash_length = 0;
+  unsigned char hash[EVP_MAX_MD_SIZE];
+
+  EVP_DigestInit_ex(context.get(), EVP_sha1(), nullptr);
+  EVP_DigestUpdate(context.get(), ws_key.c_str(), ws_key.size());
+  EVP_DigestUpdate(context.get(), ws_accept_magic,
+                   std::strlen(ws_accept_magic));
+  EVP_DigestFinal_ex(context.get(), hash, &hash_length);
+
+  return base64_encode(std::string(hash, hash + hash_length));
 }
 
 class NotifyHandle {
@@ -1167,6 +1226,204 @@ inline bool WSConnectionBase<IsServer>::process_websocket_main(
 }
 
 } // namespace detail
+
+// WebSocket client implementation
+inline WebSocketClient::WebSocketClient(const std::string &scheme_host_port)
+    : WebSocketClient(scheme_host_port, std::string(), std::string()) {}
+
+inline WebSocketClient::WebSocketClient(const std::string &scheme_host_port,
+                                        const std::string &client_cert_path,
+                                        const std::string &client_key_path) {
+  const static std::regex re(
+      R"((?:([a-z]+):\/\/)?(?:\[([a-fA-F\d:]+)\]|([^:/?#]+))(?::(\d+))?)");
+
+  std::smatch m;
+  if (std::regex_match(scheme_host_port, m, re)) {
+    auto scheme = m[1].str();
+
+    if (!scheme.empty() && (scheme != "ws" && scheme != "wss")) {
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+      std::string msg = "'" + scheme + "' scheme is not supported.";
+      throw std::invalid_argument(msg);
+#endif
+      return;
+    }
+
+    is_ssl_ = scheme == "wss";
+
+    auto host = m[2].str();
+    if (host.empty()) { host = m[3].str(); }
+
+    auto port_str = m[4].str();
+    auto port = !port_str.empty() ? std::stoi(port_str) : (is_ssl_ ? 443 : 80);
+
+    if (is_ssl_) {
+      cli_ = detail::make_unique<SSLClient>(host, port, client_cert_path,
+                                            client_key_path);
+    } else {
+      cli_ = detail::make_unique<ClientImpl>(host, port, client_cert_path,
+                                             client_key_path);
+    }
+  } else {
+    cli_ = detail::make_unique<ClientImpl>(scheme_host_port, 80,
+                                           client_cert_path, client_key_path);
+  }
+}
+
+inline WebSocketClient::WebSocketClient(const std::string &host, int port)
+    : cli_(detail::make_unique<ClientImpl>(host, port)) {}
+
+inline WebSocketClient::WebSocketClient(const std::string &host, int port,
+                                        const std::string &client_cert_path,
+                                        const std::string &client_key_path)
+    : cli_(detail::make_unique<ClientImpl>(host, port, client_cert_path,
+                                           client_key_path)) {}
+
+inline WebSocketClient::~WebSocketClient() {
+  if (thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (notify_handle_ != nullptr) {
+        stop_requested_ = true;
+        notify_handle_->notify();
+      }
+    }
+    thread_.join();
+  }
+}
+
+inline bool WebSocketClient::is_valid() const {
+  return cli_ != nullptr && cli_->is_valid();
+}
+
+inline bool WebSocketClient::connect(const std::string &path,
+                                     WSMessageHandler message_handler) {
+  return connect(path, Headers{}, WSSubprotocols{}, std::move(message_handler));
+}
+
+inline bool WebSocketClient::connect(const std::string &path,
+                                     const Headers &headers,
+                                     const WSSubprotocols &subprotocols,
+                                     WSMessageHandler message_handler) {
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!(conn_state_ == ConnectionState::Disconnected ||
+          conn_state_ == ConnectionState::Failed)) {
+      return false;
+    }
+    conn_state_ = ConnectionState::Connecting;
+    // No need to notify here
+  }
+
+  // Don't send stale messages
+  if (!msg_queue_.empty()) { std::queue<detail::WSMessage>().swap(msg_queue_); }
+
+  auto ws_key = detail::base64_encode(detail::random_string(16));
+
+  Request req;
+  req.method = "GET";
+  req.path = path;
+  req.headers = headers;
+  req.headers.emplace("Connection", "upgrade");
+  req.headers.emplace("Upgrade", "websocket");
+  req.headers.emplace("Sec-WebSocket-Version", "13");
+  req.headers.emplace("Sec-WebSocket-Key", ws_key);
+
+  if (!subprotocols.empty()) {
+    std::stringstream ss;
+    for (size_t i = 0, last = subprotocols.size() - 1; i <= last; ++i) {
+      ss << subprotocols[i];
+      if (i != last) { ss << ", "; }
+    }
+    req.headers.emplace("Sec-WebSocket-Protocol", ss.str());
+  }
+
+  req.response_handler = [&, this](const Response &res) {
+    return validate_response(res, ws_key, subprotocols);
+  };
+
+  req.stream_handler = [&, this](Stream &strm) -> bool {
+    return process_websocket(strm, std::move(message_handler));
+  };
+
+  thread_ = std::thread([&, this]() {
+    Response res;
+    Error error;
+    // On success, our stream_handler will be called, which updates state and
+    // notifies; on failure, we'll update state and notify here
+    if (!cli_->send(req, res, error)) {
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        conn_state_ = ConnectionState::Failed;
+      }
+      cond_.notify_all();
+    }
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cond_.wait(lock,
+               [&] { return conn_state_ != ConnectionState::Connecting; });
+    if (conn_state_ == ConnectionState::Failed) {
+      return false;
+    } else if (conn_state_ == ConnectionState::Connected) {
+      return true;
+    } else {
+      // At this point, we should either be connected or have failed to connect
+      assert(false);
+    }
+  }
+
+  return false;
+}
+
+inline bool
+WebSocketClient::validate_response(const Response &res,
+                                   const std::string &ws_key,
+                                   const WSSubprotocols &subprotocols) {
+  if (res.status != StatusCode::SwitchingProtocol_101) { return false; }
+
+  // TODO Rewrite once utility functions for proper handling become available
+  // I.e., this ignores field repetitions and comma-separated values
+  if (!res.has_header("Connection") ||
+      !detail::case_ignore::equal(res.get_header_value("Connection"),
+                                  "upgrade")) {
+    return false;
+  }
+  if (!res.has_header("Upgrade") ||
+      !detail::case_ignore::equal(res.get_header_value("Upgrade"),
+                                  "websocket")) {
+    return false;
+  }
+  if (res.has_header("Sec-WebSocket-Version") &&
+      res.get_header_value("Sec-WebSocket-Version") != "13") {
+    return false;
+  }
+
+  // We requested no extensions
+  if (res.has_header("Sec-WebSocket-Extensions")) { return false; }
+
+  if (!res.has_header("Sec-WebSocket-Accept")) { return false; }
+  auto ws_accept = res.get_header_value("Sec-WebSocket-Accept");
+  auto ws_accept_expected = detail::make_ws_accept(ws_key);
+  if (ws_accept != ws_accept_expected) { return false; }
+
+  if (res.has_header("Sec-WebSocket-Protocol")) {
+    // Server MUST send at most ONE protocol field
+    if (res.get_header_value_count("Sec-WebSocket-Protocol") > 1) {
+      return false;
+    }
+
+    const auto &subprotocol = res.get_header_value("Sec-WebSocket-Protocol");
+    if (std::find(subprotocols.begin(), subprotocols.end(), subprotocol) ==
+        subprotocols.end()) {
+      return false;
+    }
+    set_subprotocol(subprotocol);
+  }
+
+  return true;
+}
 
 // ----------------------------------------------------------------------------
 
