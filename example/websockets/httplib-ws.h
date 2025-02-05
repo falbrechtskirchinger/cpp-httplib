@@ -28,13 +28,62 @@
 
 namespace httplib {
 
+// See https://www.iana.org/assignments/websocket/websocket.xhtml
+enum class WSCloseCode {
+  NormalClosure_1000 = 1000,
+  GoingAway_1001 = 1001,
+  ProtocolError_1002 = 1002,
+  UnsupportedData_1003 = 1003,
+  // Reserved = 1004,
+  NoStatusRcvd_1005 = 1005,    // internal
+  AbnormalClosure_1006 = 1006, // internal
+  InvalidFramePayloadData_1007 = 1007,
+  PolicyViolation_1008 = 1008,
+  MessageTooBig_1009 = 1009,
+  MandatoryExtension_1010 = 1010,
+  InternalError_1011 = 1011,
+  ServiceRestart_1012 = 1012,
+  TryAgainLater_1013 = 1013,
+  BadGateway_1014 = 1014,
+  TLSHandshake_1015 = 1015, // internal
+};
 
+const char *close_reason(WSCloseCode close_code);
+
+std::string to_string(WSCloseCode close_code);
 
 // ----------------------------------------------------------------------------
 
 /*
  * Implementation that will be part of the .cc file if split into .h + .cc.
  */
+
+inline const char *close_reason(WSCloseCode close_code) {
+  switch (close_code) {
+  case WSCloseCode::NormalClosure_1000: return "Normal Closure";
+  case WSCloseCode::GoingAway_1001: return "Going Away";
+  case WSCloseCode::ProtocolError_1002: return "ProtocolErrory";
+  case WSCloseCode::UnsupportedData_1003: return "UnsupportedData";
+  // Reserved 1004
+  case WSCloseCode::NoStatusRcvd_1005: return "No Status Rcvd (Internal)";
+  case WSCloseCode::AbnormalClosure_1006: return "Abnormal Closure (Internal)";
+  case WSCloseCode::InvalidFramePayloadData_1007:
+    return "Invalid Frame Payload Data";
+  case WSCloseCode::PolicyViolation_1008: return "Policy Violation";
+  case WSCloseCode::MessageTooBig_1009: return "Message Too Big";
+  case WSCloseCode::MandatoryExtension_1010: return "Mandatory Extension";
+  default:
+  case WSCloseCode::InternalError_1011: return "Internal Error";
+  case WSCloseCode::ServiceRestart_1012: return "Service Restart";
+  case WSCloseCode::TryAgainLater_1013: return "Try Again Later";
+  case WSCloseCode::BadGateway_1014: return "Bad Gateway";
+  case WSCloseCode::TLSHandshake_1015: return "TLS Handshake (Internal)";
+  }
+}
+
+inline std::string to_string(WSCloseCode close_code) {
+  return close_reason(close_code);
+}
 
 namespace detail {
 
