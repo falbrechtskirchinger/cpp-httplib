@@ -22,6 +22,9 @@
 
 #include "httplib.h"
 
+#include <queue>
+#include <type_traits>
+
 /*
  * Declaration
  */
@@ -51,6 +54,120 @@ enum class WSCloseCode {
 const char *close_reason(WSCloseCode close_code);
 
 std::string to_string(WSCloseCode close_code);
+
+enum class WSMessageType {
+  Text,
+  Binary,
+  Ping,
+  Pong,
+};
+
+using WSMessageHandler =
+    std::function<void(std::string msg, WSMessageType msg_type)>;
+
+enum class WSPingAction {
+  Ignore,
+  AutoReply = 0b01,   // Echo data back as Pong
+  CallHandler = 0b10, // Call message handler
+  AutoReplyAndCallHandler = AutoReply | CallHandler,
+};
+
+enum class WSPongAction {
+  Ignore,
+  MatchOrClose, // Must match Ping or connection is closed
+  CallHandler,  // Call message handler
+};
+
+namespace detail {
+
+class NotifyHandle;
+
+inline namespace ws {
+
+struct WSMessage {
+  uint16_t cookie;
+  uint8_t opcode;
+  std::string payload;
+};
+
+} // namespace ws
+
+template <bool IsServer> class WSConnectionBase {
+public:
+  WSConnectionBase() = default;
+  WSConnectionBase(const WSConnectionBase &) = delete;
+  WSConnectionBase(WSConnectionBase &&) = default;
+
+  bool close(WSCloseCode close_code = WSCloseCode::NormalClosure_1000);
+  bool close(WSCloseCode close_code, const char *reason_ptr);
+  bool close(WSCloseCode close_code, const char *reason_ptr, size_t reason_len);
+
+  void wait_closed();
+
+  bool send(const char *ptr, size_t size, WSMessageType msg_type);
+  bool send(const char *ptr, WSMessageType msg_type = WSMessageType::Text);
+  bool send(const std::string &msg, WSMessageType msg_type);
+  bool send(std::string &&msg, WSMessageType msg_type);
+
+  bool subprotocol_negotiated() const;
+  const std::string &subprotocol() const;
+
+  WSCloseCode close_code() const;
+  const std::string &close_reason() const;
+
+  void set_ping_action(WSPingAction action);
+  void set_pong_action(WSPongAction action);
+
+protected:
+  enum class ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Failed,
+  };
+
+  void set_subprotocol(const std::string &subprotocol);
+
+  bool enqueue_msg(detail::WSMessage &&msg, bool wait_proc);
+
+  bool process_websocket(Stream &strm, WSMessageHandler message_handler);
+  bool process_websocket_main(Stream &strm,
+                              const WSMessageHandler &message_handler);
+
+  std::mutex mutex_;
+  std::condition_variable cond_;
+
+  std::queue<detail::WSMessage> msg_queue_;
+
+  std::string subprotocol_;
+  mutable std::string close_reason_;
+
+  const detail::NotifyHandle *notify_handle_ = nullptr;
+
+  ConnectionState conn_state_ = ConnectionState::Disconnected;
+
+  WSCloseCode close_code_ = WSCloseCode::NoStatusRcvd_1005;
+
+  WSPingAction ping_action_ = WSPingAction::AutoReply;
+  WSPongAction pong_action_ =
+      IsServer ? WSPongAction::MatchOrClose : WSPongAction::Ignore;
+
+  // Messages are assigned a cookie to track when they've been processed
+  uint16_t msg_cookie_next_ = 0;   // Next cookie value
+  uint16_t msg_cookie_result_ = 0; // Result for condition variable
+
+  bool subprotocol_negotiated_ = false;
+  bool stop_requested_ = false;
+  bool msg_proc_result_ = false; // Cookie'd msg processed OK?
+
+#ifndef NDEBUG
+  // Users obtain an unconnected connection object. To prevent hard-to-diagnose
+  // issues, enforce calling wait_until_ready() in debug builds
+  bool wait_until_ready_called_ = false;
+#endif
+};
+
+} // namespace detail
 
 // ----------------------------------------------------------------------------
 
@@ -115,6 +232,13 @@ enum OpCode : uint8_t {
 using WSFrameHeader = uint8_t[2];
 
 } // namespace ws
+
+template <typename Enum,
+          typename std::enable_if<std::is_enum<Enum>::value, int>::type = 0>
+bool bitset_is_set(Enum a, Enum b) {
+  using T = typename std::underlying_type<Enum>::type;
+  return static_cast<T>(a) & static_cast<T>(b);
+}
 
 inline bool pipe(socket_t fds[2]) {
   fds[0] = fds[1] = INVALID_SOCKET;
@@ -212,6 +336,73 @@ inline bool socketpair_inet(socket_t socks[2]) {
   ssock = csock = INVALID_SOCKET; // Prevent closing on scope exit
 
   return true;
+}
+
+template <typename T, size_t N,
+          typename std::enable_if<sizeof(T) == 1, int>::type = 0>
+inline void apply_mask(const T (&mask)[N], std::string &data) {
+  size_t i = 0;
+  std::transform(data.begin(), data.end(), data.begin(),
+                 [&](char c) mutable -> char { return c ^ mask[i++ % N]; });
+}
+
+inline bool write_msg(Stream &strm, WSMessage &msg, bool mask_payload) {
+  using namespace ws;
+
+  size_t write_offset = 0;
+  WSFrameHeader header;
+  uint8_t mask[4]{};
+  char buf[sizeof(header) + sizeof(uint64_t) + sizeof(mask)];
+
+  header[0] = WSProto::Header0_IsFinal | msg.opcode;
+  header[1] = mask_payload ? WSProto::Header1_IsMasked : 0;
+  write_offset = sizeof(header);
+
+  // Write payload length and, if required, extended payload length in network
+  // byte order
+  if (msg.payload.size() <= 125) {
+    header[1] |= static_cast<uint8_t>(msg.payload.size());
+  } else if (msg.payload.size() <= std::numeric_limits<uint16_t>::max()) {
+    header[1] |= 126;
+    uint16_t payload_length = static_cast<uint16_t>(msg.payload.size());
+    for (unsigned i = 0; i < sizeof(payload_length); ++i) {
+      buf[write_offset + sizeof(payload_length) - i - 1] =
+          static_cast<char>(payload_length & 0xff);
+      payload_length >>= 8;
+    }
+    write_offset += sizeof(payload_length);
+  } else {
+    header[1] |= 127;
+    uint64_t payload_length = static_cast<uint64_t>(msg.payload.size());
+
+    if (payload_length & (1ULL << 63)) { return false; }
+
+    for (unsigned i = 0; i < sizeof(payload_length); ++i) {
+      buf[write_offset + sizeof(payload_length) - i - 1] =
+          static_cast<char>(payload_length & 0xff);
+      payload_length >>= 8;
+    }
+    write_offset += sizeof(payload_length);
+  }
+
+  // Copy header, payload length, and maybe mask
+  std::memcpy(buf, header, sizeof(header));
+  if (mask_payload) {
+    random_bytes(reinterpret_cast<char *>(mask), sizeof(mask), false);
+    std::memcpy(buf + write_offset, mask, sizeof(mask));
+    write_offset += sizeof(mask);
+  }
+  assert(write_offset <= sizeof(buf));
+  // Send it
+  if (!write_data(strm, buf, write_offset)) {
+    // TODO Report errors like these to the user ... somehow ...
+    // WebSocketClient::error()?
+    return false;
+  }
+
+  // Mask payload if requested and send it
+  if (mask_payload) { apply_mask(mask, msg.payload); }
+  return write_data(strm, msg.payload.data(), msg.payload.size());
 }
 
 class NotifyHandle {
@@ -593,6 +784,386 @@ inline bool WSReader::handle_payload_length() {
   }
 
   return true;
+}
+
+// WSConnectionBase implementation
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::close(WSCloseCode close_code) {
+  return close(close_code, httplib::close_reason(close_code));
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::close(WSCloseCode close_code,
+                                              const char *reason_ptr) {
+  if (reason_ptr) {
+    return close(close_code, reason_ptr, std::strlen(reason_ptr));
+  } else {
+    return close(close_code, nullptr, 0);
+  }
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::close(WSCloseCode close_code,
+                                              const char *reason_ptr,
+                                              size_t reason_len) {
+  using namespace detail::ws;
+
+  uint16_t temp = ::htons(static_cast<uint16_t>(close_code));
+  WSMessage msg;
+  msg.opcode = WSProto::OpCode_Close;
+  msg.payload.resize(sizeof(temp) + reason_len);
+  std::memcpy(&msg.payload[0], &temp, sizeof(temp));
+  if (reason_ptr) {
+    std::memcpy(&msg.payload[sizeof(temp)], reason_ptr, reason_len);
+  }
+  return enqueue_msg(std::move(msg), true);
+}
+
+template <bool IsServer> inline void WSConnectionBase<IsServer>::wait_closed() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cond_.wait(lock,
+             [&] { return conn_state_ == ConnectionState::Disconnected; });
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::send(const char *ptr, size_t size,
+                                             WSMessageType msg_type) {
+  using namespace detail::ws;
+
+  WSMessage msg;
+  msg.opcode = msg_type == WSMessageType::Text ? WSProto::OpCode_Text
+                                               : WSProto::OpCode_Binary;
+  msg.payload.assign(ptr, size);
+  return enqueue_msg(std::move(msg), true);
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::send(const char *ptr,
+                                             WSMessageType msg_type) {
+  return send(ptr, std::strlen(ptr), msg_type);
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::send(const std::string &msg,
+                                             WSMessageType msg_type) {
+  using namespace detail::ws;
+
+  WSMessage ws_msg;
+  ws_msg.opcode = msg_type == WSMessageType::Text ? WSProto::OpCode_Text
+                                                  : WSProto::OpCode_Binary;
+  ws_msg.payload = msg;
+  return enqueue_msg(std::move(ws_msg), true);
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::send(std::string &&msg,
+                                             WSMessageType msg_type) {
+  using namespace detail::ws;
+
+  WSMessage ws_msg;
+  ws_msg.opcode = msg_type == WSMessageType::Text ? WSProto::OpCode_Text
+                                                  : WSProto::OpCode_Binary;
+  ws_msg.payload = std::move(msg);
+  return enqueue_msg(std::move(ws_msg), true);
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::subprotocol_negotiated() const {
+  return subprotocol_negotiated_;
+}
+
+template <bool IsServer>
+inline const std::string &WSConnectionBase<IsServer>::subprotocol() const {
+  return subprotocol_;
+}
+
+template <bool IsServer>
+inline WSCloseCode WSConnectionBase<IsServer>::close_code() const {
+  return close_code_;
+}
+
+template <bool IsServer>
+inline const std::string &WSConnectionBase<IsServer>::close_reason() const {
+  if (close_reason_.empty()) {
+    close_reason_ = httplib::close_reason(close_code_);
+  }
+  return close_reason_;
+}
+
+template <bool IsServer>
+inline void WSConnectionBase<IsServer>::set_ping_action(WSPingAction action) {
+  ping_action_ = action;
+}
+
+template <bool IsServer>
+inline void WSConnectionBase<IsServer>::set_pong_action(WSPongAction action) {
+  pong_action_ = action;
+}
+
+template <bool IsServer>
+inline void
+WSConnectionBase<IsServer>::set_subprotocol(const std::string &subprotocol) {
+  subprotocol_ = subprotocol;
+  subprotocol_negotiated_ = true;
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::enqueue_msg(detail::WSMessage &&msg,
+                                                    bool wait_proc) {
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  assert(!IsServer || (IsServer && wait_until_ready_called_));
+  if (notify_handle_ == nullptr) { return false; }
+
+  // Set cookie
+  uint16_t cookie = 0;
+  if (wait_proc) {
+    msg_cookie_next_ += 1;
+    if (msg_cookie_next_ == 0) { msg_cookie_next_ = 1; }
+    cookie = msg_cookie_next_;
+  }
+  msg.cookie = cookie;
+
+  msg_queue_.push(std::move(msg));
+  notify_handle_->notify();
+  if (wait_proc) {
+    // TODO Dead-lock check in debug mode
+    cond_.wait(lock, [&] {
+      return msg_cookie_result_ == cookie ||
+             conn_state_ != ConnectionState::Connected;
+    });
+    msg_cookie_result_ = 0;
+    if (conn_state_ != ConnectionState::Connected) {
+      // Clear queue
+      if (!msg_queue_.empty()) { std::queue<WSMessage>().swap(msg_queue_); }
+      return false;
+    }
+    return msg_proc_result_;
+  }
+  return true;
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::process_websocket(
+    Stream &strm, WSMessageHandler message_handler) {
+  NotifyHandle notify_handle{};
+  if (!notify_handle.is_valid()) { return false; }
+
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    notify_handle_ = &notify_handle;
+    conn_state_ = ConnectionState::Connected;
+  }
+  cond_.notify_all();
+  bool ret = process_websocket_main(strm, message_handler);
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    conn_state_ = ConnectionState::Disconnected;
+    notify_handle_ = nullptr;
+  }
+  cond_.notify_all();
+
+  return ret;
+}
+
+template <bool IsServer>
+inline bool WSConnectionBase<IsServer>::process_websocket_main(
+    Stream &strm, const WSMessageHandler &message_handler) {
+  using namespace ws;
+
+  bool readable, readable_buffered, notified = false;
+  WSReader reader(strm, IsServer);
+  WSMessage msg;
+  bool proc_msg = false;
+
+  auto stream_is_readable_or_notified = [&]() -> bool {
+    return select_read(strm.socket(), notify_handle_->fd(),
+                       static_cast<time_t>(-1), 0, readable, notified) > 0;
+  };
+  auto check_notified = [&]() {
+    notified = select_read(notify_handle_->fd(), 0, 0) > 0;
+  };
+  auto dispatch_msg = [&](std::string &msg, WSMessageType msg_type) {
+    // TODO This is just a crude hack to prevent dead-locks
+    // Users should be able to choose between different dispatch options:
+    // - same thread (can dead-lock, but users may wish to hand off to their own
+    //   thread pool, etc.)
+    // - internal thread pool
+    std::thread(
+        [&](std::string &&msg, WSMessageType msg_type) {
+          message_handler(std::move(msg), msg_type);
+        },
+        std::move(msg), msg_type)
+        .detach();
+  };
+  auto close_internal = [&](WSCloseCode close_code,
+                            const char *reason_ptr = nullptr, size_t len = 0) {
+    const char *reason =
+        reason_ptr ? reason_ptr : httplib::close_reason(close_code);
+    auto reason_len = reason_ptr ? len : std::strlen(reason);
+    uint16_t temp = ::htons(static_cast<uint16_t>(close_code));
+    WSMessage msg;
+    msg.opcode = WSProto::OpCode_Close;
+    msg.payload.resize(sizeof(temp) + reason_len);
+    std::memcpy(&msg.payload[0], &temp, sizeof(temp));
+    std::memcpy(&msg.payload[sizeof(temp)], reason, reason_len);
+    enqueue_msg(std::move(msg), false);
+  };
+
+  std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+  while (true) {
+    // Check if there's anything to read, or if we've been notified, unless the
+    // connection is closing
+    if (!reader.is_closing_await_send()) {
+      readable = false;
+      readable_buffered = strm.nonblocking_read_size() > 0;
+      if (readable_buffered) {
+        // Reading from the buffer; ensure we don't fall behind on notifications
+        check_notified();
+      } else if (!stream_is_readable_or_notified()) {
+        continue; // Timed out
+      }
+      if (notified) {
+        notify_handle_->clear();
+        assert(!lock);
+        lock.lock();
+        if (stop_requested_) { return true; }
+        // Release or continue holding the lock depending on whether we're going
+        // to read or process messages next
+        if (proc_msg) { lock.unlock(); }
+      }
+
+      // Alternate between reading and processing messages
+      // not notified => always read
+      // notified and proc_msg because we just processed one => read
+      // notified and not proc_msg because we just read => process messages
+      if ((!notified || (notified && proc_msg)) &&
+          (readable || readable_buffered)) {
+        WSReadResult result;
+        do {
+          result = reader.read(readable);
+          if (result == WSReadResult::Error) {
+            // frame failed validation; proper close code should have been set
+            assert(reader.close_code() != WSCloseCode::NoStatusRcvd_1005);
+            if (reader.close_code() != WSCloseCode::AbnormalClosure_1006) {
+              reader.is_closing_await_recv(true);
+              close_internal(reader.close_code());
+            } else {
+              // Connection closed abnormally; nothing left to do
+              return false;
+            }
+          }
+        } while (result == WSReadResult::Again);
+        auto &frame = reader.current_frame();
+        if (frame.is_complete) { // Complete frame read
+          if (IsServer) { apply_mask(frame.mask, frame.payload); }
+          switch (frame.opcode) {
+          case WSProto::OpCode_Text:
+          case WSProto::OpCode_Binary:
+            dispatch_msg(frame.payload, frame.opcode == WSProto::OpCode_Text
+                                            ? WSMessageType::Text
+                                            : WSMessageType::Binary);
+            break;
+          case WSProto::OpCode_Close:
+            if (reader.is_closing_await_recv()) {
+              // Server responded to our close frame; we're done
+              // TODO Record close code and reason
+              return true;
+            } else {
+              const char *reason = nullptr;
+              size_t len = 0;
+              uint16_t temp;
+              WSCloseCode close_code = WSCloseCode::NormalClosure_1000;
+              if (frame.payload.size() >= sizeof(temp)) {
+                std::memcpy(&temp, &frame.payload[0], sizeof(temp));
+                close_code = static_cast<WSCloseCode>(::ntohs(temp));
+                if (frame.payload.size() > sizeof(temp)) {
+                  reason = &frame.payload[sizeof(temp)];
+                  len = frame.payload.size() - sizeof(temp);
+                }
+              }
+              reader.is_closing_await_send(true);
+              close_internal(close_code, reason, len);
+            }
+            break;
+          case WSProto::OpCode_Ping:
+            if (bitset_is_set(ping_action_, WSPingAction::CallHandler)) {
+              // Note that callee can modify the application data, before it
+              // is sent back, if AutoReply is enabled
+              dispatch_msg(frame.payload, WSMessageType::Ping);
+            }
+            if (bitset_is_set(ping_action_, WSPingAction::AutoReply)) {
+              WSMessage pong;
+              pong.opcode = WSProto::OpCode_Pong;
+              pong.payload = std::move(frame.payload);
+              enqueue_msg(std::move(pong), false);
+            }
+            break;
+          case WSProto::OpCode_Pong:
+            // TODO Implement pong action
+            break;
+          default:
+            reader.is_closing_await_send(true);
+            close_internal(WSCloseCode::ProtocolError_1002);
+            break;
+          }
+        }
+      }
+
+      if (!notified) {
+        proc_msg = false;
+        continue;
+      }
+    }
+
+    // Process message queue
+    {
+      assert(!proc_msg || (proc_msg && !lock));
+      if (!lock) { lock.lock(); }
+      proc_msg = !msg_queue_.empty();
+      if (proc_msg) {
+        msg = std::move(msg_queue_.front());
+        msg_queue_.pop();
+      }
+      lock.unlock();
+    }
+
+    if (proc_msg) {
+      if (msg.opcode == WSProto::OpCode_Close &&
+          !reader.is_closing_await_send()) {
+        // We're about to initiate a close; wait for the server to respond
+        // if the close was initiated by the user, this hasn't been set yet
+        reader.is_closing_await_recv(true);
+      }
+
+      uint16_t cookie = msg.cookie;
+      bool ret = write_msg(strm, msg, !IsServer);
+      {
+        // Report result back to caller
+        lock.lock();
+        msg_cookie_result_ = cookie;
+        msg_proc_result_ = ret;
+        lock.unlock();
+      }
+      cond_.notify_all();
+      if (!ret) { return false; }
+
+      if (msg.opcode == WSProto::OpCode_Close &&
+          reader.is_closing_await_send()) {
+        // Closing handshake complete (initiated by remote)
+        return true;
+      }
+    } else if (reader.is_closing_await_send()) {
+      // This case should not happen; i.e., waiting to send a close frame, but
+      // the send queue is empty
+      assert(false);
+      return false;
+    }
+  }
+
+  // We should never reach here
+  assert(false);
+  return false;
 }
 
 } // namespace detail
