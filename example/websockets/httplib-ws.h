@@ -169,6 +169,8 @@ protected:
 #endif
 };
 
+template <typename ServerType> class BasicWebSocketServer;
+
 } // namespace detail
 
 class WebSocketClient : public detail::WSConnectionBase<false> {
@@ -209,6 +211,128 @@ private:
 
   bool is_ssl_ = false;
 };
+
+class WSConnection;
+using WSConnectionPtr = std::shared_ptr<WSConnection>;
+using WSConnectionWPtr = std::weak_ptr<WSConnection>;
+
+class WSResponse;
+using WSConnectionHandler = std::function<void(const Request &, WSResponse &)>;
+using WSServerMessageHandler =
+    std::function<void(WSConnection &, std::string, WSMessageType)>;
+
+class WSConnection : public detail::WSConnectionBase<true>,
+                     public std::enable_shared_from_this<WSConnection> {
+private:
+  // For std::make_shared
+  struct AccessToken {
+    explicit AccessToken() = default;
+  };
+
+public:
+  WSConnection(AccessToken);
+  WSConnection(const WSConnection &) = delete;
+  WSConnection &operator=(const WSConnection &) = delete;
+
+  intptr_t id() const;
+
+  void wait_until_ready();
+
+private:
+  WSConnection();
+
+  void mark_ready();
+
+  template <typename T> friend class detail::BasicWebSocketServer;
+
+  // To create the connection in accept()
+  friend class WSResponse;
+};
+
+class WSResponse {
+public:
+  WSResponse(Response &http_res);
+
+  Response &http();
+
+  bool is_accepted() const;
+
+  bool subprotocol_negotiated() const;
+  const std::string &subprotocol() const;
+
+  WSConnectionPtr accept();
+
+private:
+  void set_subprotocol(const std::string &subprotocol);
+
+  WSConnectionPtr get_connection() const;
+
+  Response *http_res_;
+  WSConnectionPtr connection_;
+  std::string subprotocol_;
+  bool subprotocol_negotiated_ = false;
+
+  template <typename T> friend class detail::BasicWebSocketServer;
+};
+
+namespace detail {
+
+struct WSMessageHandlerAdapter {
+  WSMessageHandlerAdapter(WSConnection &connection,
+                          WSServerMessageHandler message_handler);
+
+  void operator()(std::string msg, WSMessageType msg_type);
+
+  WSConnection *connection_;
+  WSServerMessageHandler message_handler_;
+};
+
+template <typename ServerType> class BasicWebSocketServer : public ServerType {
+public:
+  using ServerType::ServerType;
+
+  BasicWebSocketServer<ServerType> &
+  GetOrWebSocket(const std::string &pattern, Server::Handler get_handler,
+                 WSConnectionHandler connection_handler,
+                 WSServerMessageHandler message_handler,
+                 WSSubprotocols subprotocols = WSSubprotocols{});
+
+  BasicWebSocketServer<ServerType> &
+  GetOrWebSocket(const std::string &pattern, Server::Handler get_handler,
+                 WSServerMessageHandler message_handler,
+                 WSSubprotocols subprotocols = WSSubprotocols{});
+
+  BasicWebSocketServer<ServerType> &
+  WebSocket(const std::string &pattern, WSConnectionHandler connection_handler,
+            WSServerMessageHandler message_handler,
+            WSSubprotocols subprotocols = WSSubprotocols{});
+
+  BasicWebSocketServer<ServerType> &
+  WebSocket(const std::string &pattern, WSServerMessageHandler message_handler,
+            WSSubprotocols subprotocols = WSSubprotocols{});
+
+private:
+  struct Endpoint {
+    Server::Handler get_handler;
+    WSConnectionHandler connection_handler;
+    WSServerMessageHandler message_handler;
+    WSSubprotocols subprotocols;
+    std::vector<WSConnectionPtr> connections;
+  };
+
+  void handle_request(Endpoint &endpoint, const Request &req, Response &res);
+
+  // C++11 doesn't have lambda capture initializers :-(
+  // Stores what we can't std::move() into lambdas
+  std::deque<Endpoint> endpoints_;
+
+  std::mutex mutex_;
+};
+
+} // namespace detail
+
+using WebSocketServer = detail::BasicWebSocketServer<Server>;
+using SSLWebSocketServer = detail::BasicWebSocketServer<SSLServer>;
 
 // ----------------------------------------------------------------------------
 
@@ -1424,6 +1548,241 @@ WebSocketClient::validate_response(const Response &res,
 
   return true;
 }
+
+// WSConnection implementation
+WSConnection::WSConnection() = default;
+
+WSConnection::WSConnection(AccessToken) : WSConnection() {
+  conn_state_ = ConnectionState::Connecting;
+}
+
+intptr_t WSConnection::id() const { return reinterpret_cast<intptr_t>(this); }
+
+inline void WSConnection::wait_until_ready() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cond_.wait(lock, [&] { return conn_state_ != ConnectionState::Connecting; });
+#ifndef NDEBUG
+  wait_until_ready_called_ = true;
+#endif
+}
+
+inline void WSConnection::mark_ready() {
+  conn_state_ = ConnectionState::Connected;
+#ifndef NDEBUG
+  wait_until_ready_called_ = true;
+#endif
+}
+
+// WSResponse implementation
+inline WSResponse::WSResponse(Response &http_res) : http_res_(&http_res) {}
+
+inline Response &WSResponse::http() { return *http_res_; }
+
+inline bool WSResponse::is_accepted() const {
+  return static_cast<bool>(connection_);
+}
+
+inline bool WSResponse::subprotocol_negotiated() const {
+  return subprotocol_negotiated_;
+}
+
+inline const std::string &WSResponse::subprotocol() const {
+  return subprotocol_;
+}
+
+inline WSConnectionPtr WSResponse::accept() {
+  if (!connection_) {
+    connection_ = std::make_shared<WSConnection>(WSConnection::AccessToken{});
+    if (subprotocol_negotiated_) { connection_->set_subprotocol(subprotocol_); }
+  }
+  return connection_;
+}
+
+inline void WSResponse::set_subprotocol(const std::string &subprotocol) {
+  subprotocol_ = subprotocol;
+  subprotocol_negotiated_ = true;
+}
+
+inline WSConnectionPtr WSResponse::get_connection() const {
+  return connection_;
+}
+
+namespace detail {
+
+// WSMessageHandlerAdapter implementation
+WSMessageHandlerAdapter::WSMessageHandlerAdapter(
+    WSConnection &connection, WSServerMessageHandler message_handler)
+    : connection_(&connection), message_handler_(message_handler) {}
+
+void WSMessageHandlerAdapter::operator()(std::string msg,
+                                         WSMessageType msg_type) {
+  message_handler_(*connection_, msg, msg_type);
+}
+
+// BasicWebSocketServer implementation
+template <typename ServerType>
+inline BasicWebSocketServer<ServerType> &
+BasicWebSocketServer<ServerType>::GetOrWebSocket(
+    const std::string &pattern, Server::Handler get_handler,
+    WSConnectionHandler connection_handler,
+    WSServerMessageHandler message_handler, WSSubprotocols subprotocols) {
+  endpoints_.emplace_back();
+  auto &endpoint = endpoints_.back();
+  endpoint.get_handler = std::move(get_handler);
+  endpoint.connection_handler = std::move(connection_handler);
+  endpoint.message_handler = std::move(message_handler);
+  endpoint.subprotocols = std::move(subprotocols);
+  ServerType::Get(pattern, [&](const Request &req, Response &res) {
+    handle_request(endpoint, req, res);
+  });
+  return *this;
+}
+
+template <typename ServerType>
+inline BasicWebSocketServer<ServerType> &
+BasicWebSocketServer<ServerType>::GetOrWebSocket(
+    const std::string &pattern, Server::Handler get_handler,
+    WSServerMessageHandler message_handler, WSSubprotocols subprotocols) {
+  return GetOrWebSocket(pattern, std::move(get_handler), nullptr,
+                        std::move(message_handler), std::move(subprotocols));
+}
+
+template <typename ServerType>
+inline BasicWebSocketServer<ServerType> &
+BasicWebSocketServer<ServerType>::WebSocket(
+    const std::string &pattern, WSConnectionHandler connection_handler,
+    WSServerMessageHandler message_handler, WSSubprotocols subprotocols) {
+  return GetOrWebSocket(pattern, nullptr, std::move(connection_handler),
+                        std::move(message_handler), std::move(subprotocols));
+}
+
+template <typename ServerType>
+inline BasicWebSocketServer<ServerType> &
+BasicWebSocketServer<ServerType>::WebSocket(
+    const std::string &pattern, WSServerMessageHandler message_handler,
+    WSSubprotocols subprotocols) {
+  return GetOrWebSocket(pattern, nullptr, nullptr, std::move(message_handler),
+                        std::move(subprotocols));
+}
+
+template <typename ServerType>
+inline void BasicWebSocketServer<ServerType>::handle_request(Endpoint &endpoint,
+                                                             const Request &req,
+                                                             Response &res) {
+  // TODO Handle field repetition and comma-separated directives
+  if (!req.has_header("Connection") ||
+      !detail::case_ignore::equal(req.get_header_value("Connection"),
+                                  "upgrade") ||
+      !req.has_header("Upgrade") ||
+      !detail::case_ignore::equal(req.get_header_value("Upgrade"),
+                                  "websocket")) {
+    res.status = StatusCode::UpgradeRequired_426;
+    return;
+  }
+  if (!req.has_header("Sec-WebSocket-Version") ||
+      req.get_header_value("Sec-WebSocket-Version") != "13") {
+    res.status = StatusCode::BadRequest_400;
+    res.set_header("Sec-WebSocket-Version", "13");
+    res.body = "Failed to open WebSocket connection: missing "
+               "Sec-WebSocket-Version header or unsupported value\n";
+    return;
+  }
+
+  auto key_count = req.get_header_value_count("Sec-WebSocket-Key");
+  if (key_count != 1) {
+    res.status = StatusCode::BadRequest_400;
+    res.body = "Failed to open WebSocket connection: ";
+    if (key_count == 0) {
+      res.body += "missing Sec-WebSocket-Key header\n";
+    } else {
+      res.body += "duplicate Sec-WebSocket-Key header\n";
+    }
+    return;
+  }
+
+  bool subprotocol_negotiated = false;
+  const std::string *subprotocol = nullptr;
+  if (req.has_header("Sec-WebSocket-Protocol")) {
+    if (endpoint.subprotocols.empty()) {
+      res.status = StatusCode::BadRequest_400;
+      res.body =
+          "Failed to open WebSocket connection: subprotocol(s) not supported";
+      return;
+    }
+
+    const auto &value = req.get_header_value("Sec-WebSocket-Protocol");
+    split(&value[0], &value[value.size()], ',',
+          [&](const char *b, const char *e) {
+            if (subprotocol_negotiated) { return; }
+
+            assert(std::distance(b, e) >= 0);
+            auto len = static_cast<size_t>(std::distance(b, e));
+            for (const auto &s : endpoint.subprotocols) {
+              if (len == s.size() && std::strncmp(b, s.data(), len) == 0) {
+                subprotocol_negotiated = true;
+                subprotocol = &s;
+                return;
+              }
+            }
+          });
+  }
+  assert((subprotocol != nullptr) == subprotocol_negotiated);
+
+  // Ignore Sec-WebSocket-Extensions, we don't support any
+
+  WSResponse ws_res(res);
+
+  if (subprotocol_negotiated) { ws_res.set_subprotocol(*subprotocol); }
+  if (endpoint.connection_handler) {
+    endpoint.connection_handler(req, ws_res);
+  } else {
+    auto connection = ws_res.accept();
+    // Without a connection handler, calling wait_until_ready() isn't necessary
+    connection->mark_ready();
+  }
+
+  if (!ws_res.is_accepted()) {
+    if (res.status == -1) { res.status = StatusCode::BadRequest_400; }
+    if (res.body.empty()) {
+      res.body = "Failed to open WebSocket connection: rejected\n";
+    }
+    return;
+  }
+
+  auto ws_accept = make_ws_accept(req.get_header_value("Sec-WebSocket-Key"));
+  res.set_header("Connection", "Upgrade");
+  res.set_header("Upgrade", "websocket");
+  res.set_header("Sec-WebSocket-Accept", ws_accept);
+  if (subprotocol_negotiated) {
+    res.set_header("Sec-WebSocket-Protocol", *subprotocol);
+  }
+  res.status = StatusCode::SwitchingProtocol_101;
+
+  auto connection = ws_res.get_connection();
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    endpoint.connections.push_back(connection);
+  }
+  res.set_stream_handler([&, this, connection](Stream &strm) {
+    auto message_handler =
+        WSMessageHandlerAdapter(*connection, endpoint.message_handler);
+    bool ret = connection->process_websocket(strm, std::move(message_handler));
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      auto it = std::find(endpoint.connections.begin(),
+                          endpoint.connections.end(), connection);
+      assert(it != endpoint.connections.end());
+      std::swap(*it, endpoint.connections.back());
+      endpoint.connections.pop_back();
+    }
+    return ret;
+  });
+}
+
+template class BasicWebSocketServer<Server>;
+template class BasicWebSocketServer<SSLServer>;
+
+} // namespace detail
 
 // ----------------------------------------------------------------------------
 
