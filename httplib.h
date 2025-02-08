@@ -3397,6 +3397,30 @@ inline bool socketpair_inet(socket_t socks[2]) {
   return true;
 }
 
+class EventPipe {
+public:
+  EventPipe();
+  EventPipe(const EventPipe &) = delete;
+  EventPipe(EventPipe &&) noexcept;
+  ~EventPipe();
+
+  EventPipe &operator=(const EventPipe &) = delete;
+  EventPipe &operator=(EventPipe &&) noexcept;
+
+  bool is_valid() const;
+
+  socket_t fd() const;
+
+  bool notify(uint8_t data = 0) const;
+  bool acknowledge(uint8_t &data) const;
+  bool acknowledge() const;
+
+  void destroy();
+
+private:
+  socket_t fds_[2] = {INVALID_SOCKET, INVALID_SOCKET};
+};
+
 class SocketStream final : public Stream {
 public:
   SocketStream(socket_t sock, time_t read_timeout_sec, time_t read_timeout_usec,
@@ -6049,6 +6073,72 @@ inline ssize_t Stream::write(const std::string &s) {
 }
 
 namespace detail {
+
+// EventPipe implementation
+inline EventPipe::EventPipe() {
+#ifdef _WIN32
+  socketpair_inet(fds_);
+#else
+  pipe(fds_);
+#endif
+}
+
+inline EventPipe::EventPipe(EventPipe &&other) noexcept {
+  std::memcpy(fds_, other.fds_, sizeof(fds_));
+  other.fds_[0] = other.fds_[1] = INVALID_SOCKET;
+}
+
+inline EventPipe::~EventPipe() { destroy(); }
+
+inline EventPipe &EventPipe::operator=(EventPipe &&other) noexcept {
+  if (this != &other) {
+    destroy();
+    std::memcpy(fds_, other.fds_, sizeof(fds_));
+    constexpr socket_t invalid_fds[2] = {INVALID_SOCKET, INVALID_SOCKET};
+    std::memcpy(other.fds_, invalid_fds, sizeof(invalid_fds));
+  }
+  return *this;
+}
+
+inline bool EventPipe::is_valid() const {
+  return fds_[0] != INVALID_SOCKET && fds_[1] != INVALID_SOCKET;
+}
+
+inline int EventPipe::fd() const { return fds_[0]; }
+
+inline bool EventPipe::notify(uint8_t data) const {
+#ifdef _WIN32
+  return send_socket(fds_[1], &data, sizeof(data)) == sizeof(data);
+#else
+  return ::write(fds_[1], &data, sizeof(data)) == sizeof(data);
+#endif
+}
+
+inline bool EventPipe::acknowledge(uint8_t &data) const {
+#ifdef _WIN32
+  return read_socket(fds_[0], &data, sizeof(data)) == sizeof(data);
+#else
+  return ::read(fds_[0], &data, sizeof(data)) == sizeof(data);
+#endif
+}
+
+inline bool EventPipe::acknowledge() const {
+  uint8_t data;
+  return acknowledge(data);
+}
+
+inline void EventPipe::destroy() {
+#ifdef _WIN32
+  if (fds_[0] != INVALID_SOCKET) { close_socket(fds_[0]); }
+  if (fds_[1] != INVALID_SOCKET) { close_socket(fds_[1]); }
+#else
+  if (fds_[0] != INVALID_SOCKET) { ::close(fds_[0]); }
+  if (fds_[1] != INVALID_SOCKET) { ::close(fds_[1]); }
+#endif
+
+  constexpr socket_t invalid_fds[2] = {INVALID_SOCKET, INVALID_SOCKET};
+  std::memcpy(fds_, invalid_fds, sizeof(invalid_fds));
+}
 
 // Socket stream implementation
 inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
