@@ -670,7 +670,7 @@ struct Request {
   bool is_chunked_content_provider_ = false;
   size_t authorization_count_ = 0;
   std::chrono::time_point<std::chrono::steady_clock> start_time_ =
-      std::chrono::steady_clock::time_point::min();
+      std::chrono::steady_clock::time_point::max();
 };
 
 struct Response {
@@ -1507,7 +1507,9 @@ protected:
   // should ONLY be called when socket_mutex_ is locked.
   // Also, shutdown_ssl and close_socket should also NOT be called concurrently
   // with a DIFFERENT thread sending requests using that socket.
-  virtual void shutdown_ssl(Socket &socket, bool shutdown_gracefully);
+  virtual void
+  shutdown_ssl(Socket &socket, bool shutdown_gracefully,
+               std::chrono::time_point<std::chrono::steady_clock> start_time);
   void shutdown_socket(Socket &socket) const;
   void close_socket(Socket &socket);
 
@@ -1997,8 +1999,12 @@ public:
 
 private:
   bool create_and_connect_socket(Socket &socket, Error &error) override;
-  void shutdown_ssl(Socket &socket, bool shutdown_gracefully) override;
-  void shutdown_ssl_impl(Socket &socket, bool shutdown_gracefully);
+  void shutdown_ssl(
+      Socket &socket, bool shutdown_gracefully,
+      std::chrono::time_point<std::chrono::steady_clock> start_time) override;
+  void shutdown_ssl_impl(
+      Socket &socket, bool shutdown_gracefully,
+      std::chrono::time_point<std::chrono::steady_clock> start_time);
 
   bool
   process_socket(const Socket &socket,
@@ -3359,7 +3365,7 @@ public:
                time_t write_timeout_sec, time_t write_timeout_usec,
                time_t max_timeout_msec = 0,
                std::chrono::time_point<std::chrono::steady_clock> start_time =
-                   std::chrono::steady_clock::time_point::min());
+                   std::chrono::steady_clock::time_point::max());
   ~SocketStream() override;
 
   bool is_readable() const override;
@@ -3395,7 +3401,7 @@ public:
       time_t read_timeout_usec, time_t write_timeout_sec,
       time_t write_timeout_usec, time_t max_timeout_msec = 0,
       std::chrono::time_point<std::chrono::steady_clock> start_time =
-          std::chrono::steady_clock::time_point::min());
+          std::chrono::steady_clock::time_point::max());
   ~SSLSocketStream() override;
 
   bool is_readable() const override;
@@ -7478,8 +7484,9 @@ inline bool ClientImpl::create_and_connect_socket(Socket &socket,
   return true;
 }
 
-inline void ClientImpl::shutdown_ssl(Socket & /*socket*/,
-                                     bool /*shutdown_gracefully*/) {
+inline void ClientImpl::shutdown_ssl(
+    Socket & /*socket*/, bool /*shutdown_gracefully*/,
+    std::chrono::time_point<std::chrono::steady_clock> /*start_time*/) {
   // If there are any requests in flight from threads other than us, then it's
   // a thread-unsafe race because individual ssl* objects are not thread-safe.
   assert(socket_requests_in_flight_ == 0 ||
@@ -7582,7 +7589,8 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
         // cannot be any requests in flight from other threads since we locked
         // request_mutex_, so safe to close everything immediately
         const bool shutdown_gracefully = false;
-        shutdown_ssl(socket_, shutdown_gracefully);
+        shutdown_ssl(socket_, shutdown_gracefully,
+                     std::chrono::steady_clock::time_point::max());
         shutdown_socket(socket_);
         close_socket(socket_);
       }
@@ -7638,7 +7646,7 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
 
     if (socket_should_be_closed_when_request_is_done_ || close_connection ||
         !ret) {
-      shutdown_ssl(socket_, true);
+      shutdown_ssl(socket_, true, req.start_time_);
       shutdown_socket(socket_);
       close_socket(socket_);
     }
@@ -7701,7 +7709,7 @@ inline bool ClientImpl::handle_request(Stream &strm, Request &req,
     // to call it from a different thread since it's a thread-safety issue
     // to do these things to the socket if another thread is using the socket.
     std::lock_guard<std::mutex> guard(socket_mutex_);
-    shutdown_ssl(socket_, true);
+    shutdown_ssl(socket_, true, req.start_time_);
     shutdown_socket(socket_);
     close_socket(socket_);
   }
@@ -8849,7 +8857,7 @@ inline void ClientImpl::stop() {
   }
 
   // Otherwise, still holding the mutex, we can shut everything down ourselves
-  shutdown_ssl(socket_, true);
+  shutdown_ssl(socket_, true, std::chrono::steady_clock::time_point::max());
   shutdown_socket(socket_);
   close_socket(socket_);
 }
@@ -9055,25 +9063,45 @@ inline SSL *ssl_new(socket_t sock, SSL_CTX *ctx, std::mutex &ctx_mutex,
   return ssl;
 }
 
-inline void ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
-                       bool shutdown_gracefully) {
+inline void
+ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
+           bool shutdown_gracefully, time_t read_timeout_sec = 0,
+           time_t read_timeout_usec = 0, time_t write_timeout_sec = 0,
+           time_t write_timeout_usec = 0, time_t max_timeout_msec = 0,
+           std::chrono::time_point<std::chrono::steady_clock> start_time = {}) {
   // sometimes we may want to skip this to try to avoid SIGPIPE if we know
   // the remote has closed the network connection
   // Note that it is not always possible to avoid SIGPIPE, this is merely a
   // best-efforts.
   if (shutdown_gracefully) {
-#ifdef _WIN32
-    (void)(sock);
-    SSL_shutdown(ssl);
-#else
-    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 1, 0);
+    // SSL_shutdown() returns 0 on first call (indicating close_notify alert
+    // sent), and 1 on subsequent call (indicating close_notify alert received)
+    if (max_timeout_msec > 0) {
+      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start_time)
+                          .count();
+      calc_actual_timeout(max_timeout_msec, duration, write_timeout_sec,
+                          write_timeout_usec, write_timeout_sec,
+                          write_timeout_usec);
+      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
+                                  write_timeout_sec, write_timeout_usec);
 
-    auto ret = SSL_shutdown(ssl);
-    while (ret == 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{100});
-      ret = SSL_shutdown(ssl);
+      if (SSL_shutdown(ssl) == 0) {
+        duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start_time)
+                       .count();
+        calc_actual_timeout(max_timeout_msec, duration, read_timeout_sec,
+                            read_timeout_usec, read_timeout_sec,
+                            read_timeout_usec);
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
+                                    read_timeout_sec, read_timeout_usec);
+
+        SSL_shutdown(ssl);
+      }
+
+    } else if (SSL_shutdown(ssl) == 0) {
+      SSL_shutdown(ssl);
     }
-#endif
   }
 
   std::lock_guard<std::mutex> guard(ctx_mutex);
@@ -9459,7 +9487,8 @@ inline SSLClient::~SSLClient() {
   // Make sure to shut down SSL since shutdown_ssl will resolve to the
   // base function rather than the derived function once we get to the
   // base class destructor, and won't free the SSL (causing a leak).
-  shutdown_ssl_impl(socket_, true);
+  shutdown_ssl_impl(socket_, true,
+                    std::chrono::steady_clock::time_point::max());
 }
 
 inline bool SSLClient::is_valid() const { return ctx_; }
@@ -9513,7 +9542,7 @@ inline bool SSLClient::connect_with_proxy(
           })) {
     // Thread-safe to close everything because we are assuming there are no
     // requests in flight
-    shutdown_ssl(socket, true);
+    shutdown_ssl(socket, true, std::chrono::steady_clock::time_point::max());
     shutdown_socket(socket);
     close_socket(socket);
     success = false;
@@ -9544,7 +9573,8 @@ inline bool SSLClient::connect_with_proxy(
                 })) {
           // Thread-safe to close everything because we are assuming there are
           // no requests in flight
-          shutdown_ssl(socket, true);
+          shutdown_ssl(socket, true,
+                       std::chrono::steady_clock::time_point::max());
           shutdown_socket(socket);
           close_socket(socket);
           success = false;
@@ -9562,7 +9592,7 @@ inline bool SSLClient::connect_with_proxy(
     res = std::move(proxy_res);
     // Thread-safe to close everything because we are assuming there are
     // no requests in flight
-    shutdown_ssl(socket, true);
+    shutdown_ssl(socket, true, std::chrono::steady_clock::time_point::max());
     shutdown_socket(socket);
     close_socket(socket);
     return false;
@@ -9677,19 +9707,23 @@ inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
   return false;
 }
 
-inline void SSLClient::shutdown_ssl(Socket &socket, bool shutdown_gracefully) {
-  shutdown_ssl_impl(socket, shutdown_gracefully);
+inline void SSLClient::shutdown_ssl(
+    Socket &socket, bool shutdown_gracefully,
+    std::chrono::time_point<std::chrono::steady_clock> start_time) {
+  shutdown_ssl_impl(socket, shutdown_gracefully, start_time);
 }
 
-inline void SSLClient::shutdown_ssl_impl(Socket &socket,
-                                         bool shutdown_gracefully) {
+inline void SSLClient::shutdown_ssl_impl(
+    Socket &socket, bool shutdown_gracefully,
+    std::chrono::time_point<std::chrono::steady_clock> start_time) {
   if (socket.sock == INVALID_SOCKET) {
     assert(socket.ssl == nullptr);
     return;
   }
   if (socket.ssl) {
-    detail::ssl_delete(ctx_mutex_, socket.ssl, socket.sock,
-                       shutdown_gracefully);
+    detail::ssl_delete(ctx_mutex_, socket.ssl, socket.sock, shutdown_gracefully,
+                       read_timeout_sec_, read_timeout_usec_,
+                       write_timeout_sec_, write_timeout_usec_, max_timeout_msec_, start_time);
     socket.ssl = nullptr;
   }
   assert(socket.ssl == nullptr);
