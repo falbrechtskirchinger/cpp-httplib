@@ -8278,7 +8278,7 @@ TEST(MaxTimeoutTest, ContentStream) {
   svr.wait_until_ready();
 
   const time_t timeout = 2000;
-  const time_t threshold = 200;
+  const time_t threshold = 10;
 
   Client cli("localhost", PORT);
   cli.set_max_timeout(std::chrono::milliseconds(timeout));
@@ -8295,7 +8295,8 @@ TEST(MaxTimeoutTest, ContentStream) {
 
     ASSERT_FALSE(res);
     EXPECT_EQ(Error::Read, res.error());
-    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold);
+    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold)
+        << "Timeout exceeded by " << (elapsed - timeout) << "ms";
   }
 
   {
@@ -8309,7 +8310,8 @@ TEST(MaxTimeoutTest, ContentStream) {
 
     ASSERT_FALSE(res);
     EXPECT_EQ(Error::Read, res.error());
-    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold);
+    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold)
+        << "Timeout exceeded by " << (elapsed - timeout) << "ms";
   }
 
   {
@@ -8326,7 +8328,8 @@ TEST(MaxTimeoutTest, ContentStream) {
 
     ASSERT_FALSE(res);
     EXPECT_EQ(Error::Read, res.error());
-    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold);
+    EXPECT_TRUE(timeout <= elapsed && elapsed < timeout + threshold)
+        << "Timeout exceeded by " << (elapsed - timeout) << "ms";
   }
 }
 
