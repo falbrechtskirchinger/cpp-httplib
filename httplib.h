@@ -6000,7 +6000,8 @@ inline void calc_actual_timeout(time_t max_timeout_msec,
   auto timeout_msec = (timeout_sec * 1000) + (timeout_usec / 1000);
 
   auto actual_timeout_msec =
-      std::min(max_timeout_msec - duration_msec, timeout_msec);
+      (std::max<time_t>)(0, (std::min)(max_timeout_msec - duration_msec,
+                                       timeout_msec));
 
   actual_timeout_sec = actual_timeout_msec / 1000;
   actual_timeout_usec = (actual_timeout_msec % 1000) * 1000;
@@ -9074,32 +9075,78 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
   // Note that it is not always possible to avoid SIGPIPE, this is merely a
   // best-efforts.
   if (shutdown_gracefully) {
-    // SSL_shutdown() returns 0 on first call (indicating close_notify alert
-    // sent), and 1 on subsequent call (indicating close_notify alert received)
+
     if (max_timeout_msec > 0) {
+      // SSL_shutdown() returns 0 on first call (indicating close_notify alert
+      // sent) and 1 on subsequent call (indicating close_notify alert received)
+      time_t timeout_sec, timeout_usec;
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start_time)
                           .count();
       calc_actual_timeout(max_timeout_msec, duration, write_timeout_sec,
-                          write_timeout_usec, write_timeout_sec,
-                          write_timeout_usec);
-      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
-                                  write_timeout_sec, write_timeout_usec);
+                          write_timeout_usec, timeout_sec, timeout_usec);
+      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec,
+                                  timeout_usec);
+
+      // To be absolutely sure we meet out timeout, we set read timeouts as
+      // well, in case close_notify has already been sent
+      // TODO We could check using SSL_get_shutdown()?
+      calc_actual_timeout(max_timeout_msec, duration, read_timeout_sec,
+                          read_timeout_usec, timeout_sec, timeout_usec);
+      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec,
+                                  timeout_usec);
 
       if (SSL_shutdown(ssl) == 0) {
         duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - start_time)
                        .count();
         calc_actual_timeout(max_timeout_msec, duration, read_timeout_sec,
-                            read_timeout_usec, read_timeout_sec,
-                            read_timeout_usec);
-        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
-                                    read_timeout_sec, read_timeout_usec);
+                            read_timeout_usec, timeout_sec, timeout_usec);
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec,
+                                    timeout_usec);
 
         SSL_shutdown(ssl);
       }
 
+      // In nonblokcing mode, SSL_shutdown() returns o until the close_notify
+      // alerts have been sent and recevied, with SSL_get_error() providing
+      // details
+      /*
+      set_nonblocking(sock, true);
+
+      auto res = 0;
+      time_t timeout_sec, timeout_usec;
+      while ((res = SSL_shutdown(ssl)) != 1) {
+        auto err = SSL_get_error(ssl, res);
+        switch (err) {
+        case SSL_ERROR_WANT_READ: {
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start_time)
+                              .count();
+          calc_actual_timeout(max_timeout_msec, duration, read_timeout_sec,
+                              read_timeout_usec, timeout_sec, timeout_usec);
+          if (timeout_sec == 0 && timeout_usec == 0) { break; }
+          if (select_read(sock, timeout_sec, timeout_usec) > 0) { continue; }
+          break;
+        }
+        case SSL_ERROR_WANT_WRITE: {
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start_time)
+                              .count();
+          calc_actual_timeout(max_timeout_msec, duration, write_timeout_sec,
+                              write_timeout_usec, timeout_sec, timeout_usec);
+          if (timeout_sec == 0 && timeout_usec == 0) { break; }
+          if (select_write(sock, timeout_sec, timeout_usec) > 0) { continue; }
+          break;
+        }
+        default: break;
+        }
+      }
+
+      set_nonblocking(sock, false);
+      */
     } else if (SSL_shutdown(ssl) == 0) {
+      // Expected to return 1, but even if it doesn't, we free ssl
       SSL_shutdown(ssl);
     }
   }
