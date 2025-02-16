@@ -9112,7 +9112,7 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
       // In nonblokcing mode, SSL_shutdown() returns o until the close_notify
       // alerts have been sent and recevied, with SSL_get_error() providing
       // details
-      set_nonblocking(sock, true);
+      /*set_nonblocking(sock, true);
 
       auto res = 0;
       time_t timeout_sec, timeout_usec;
@@ -9144,7 +9144,24 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
         break;
       }
 
-      set_nonblocking(sock, false);
+      set_nonblocking(sock, false);*/
+
+      #ifdef _WIN32
+      (void)(sock);
+      SSL_shutdown(ssl);
+  #else
+      timeval tv;
+      tv.tv_sec = 1;
+      tv.tv_usec = 0;
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const void *>(&tv), sizeof(tv));
+  
+      auto ret = SSL_shutdown(ssl);
+      while (ret == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        ret = SSL_shutdown(ssl);
+      }
+  #endif
 
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now() - t0)
