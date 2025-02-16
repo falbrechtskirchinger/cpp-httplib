@@ -9079,7 +9079,7 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
     if (max_timeout_msec > 0) {
       // SSL_shutdown() returns 0 on first call (indicating close_notify alert
       // sent) and 1 on subsequent call (indicating close_notify alert received)
-      time_t timeout_sec, timeout_usec;
+      /*time_t timeout_sec, timeout_usec;
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start_time)
                           .count();
@@ -9106,12 +9106,11 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
                                     timeout_usec);
 
         SSL_shutdown(ssl);
-      }
+      }*/
 
       // In nonblokcing mode, SSL_shutdown() returns o until the close_notify
       // alerts have been sent and recevied, with SSL_get_error() providing
       // details
-      /*
       set_nonblocking(sock, true);
 
       auto res = 0;
@@ -9144,7 +9143,6 @@ ssl_delete(std::mutex &ctx_mutex, SSL *ssl, socket_t sock,
       }
 
       set_nonblocking(sock, false);
-      */
     } else if (SSL_shutdown(ssl) == 0) {
       // Expected to return 1, but even if it doesn't, we free ssl
       SSL_shutdown(ssl);
