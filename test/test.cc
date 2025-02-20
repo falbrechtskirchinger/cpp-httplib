@@ -8358,6 +8358,9 @@ static void stream_handler_test(S &svr, C &cli) {
   const auto timeout_us =
       std::chrono::duration_cast<std::chrono::microseconds>(delay).count() / 2;
 
+  //svr.set_tcp_nodelay(true);
+  //cli.set_tcp_nodelay(true);
+
   svr.Get("/", [delay](const Request &req, Response &res) {
     // Request should contain limited default headers
     EXPECT_EQ(req.has_header("Host"), true);
@@ -8430,6 +8433,13 @@ static void stream_handler_test(S &svr, C &cli) {
 
     // Server should have closed connection
     n = strm.read(buf, sizeof(buf));
+
+    if (n == -1) {
+#ifdef _WIN32
+      EXPECT_EQ(WSAGetLastError(), WSAECONNRESET);
+#endif
+    }
+
     EXPECT_EQ(0, n);
 
     return true;
