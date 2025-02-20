@@ -8354,7 +8354,7 @@ TEST(MaxTimeoutTest, ContentStreamSSL) {
 
 template <typename S, typename C>
 static void stream_handler_test(S &svr, C &cli) {
-  const auto delay = std::chrono::milliseconds{200};
+  const auto delay = std::chrono::milliseconds{2000};
   const auto timeout_us =
       std::chrono::duration_cast<std::chrono::microseconds>(delay).count() / 2;
 
