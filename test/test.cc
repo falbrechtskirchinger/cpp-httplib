@@ -8358,8 +8358,8 @@ static void stream_handler_test(S &svr, C &cli) {
   const auto timeout_us =
       std::chrono::duration_cast<std::chrono::microseconds>(delay).count() / 2;
 
-  //svr.set_tcp_nodelay(true);
-  //cli.set_tcp_nodelay(true);
+  svr.set_tcp_nodelay(true);
+  cli.set_tcp_nodelay(true);
 
   svr.Get("/", [delay](const Request &req, Response &res) {
     // Request should contain limited default headers
