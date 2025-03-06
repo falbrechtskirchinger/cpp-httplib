@@ -99,7 +99,7 @@
 #endif
 
 #ifndef CPPHTTPLIB_PAYLOAD_MAX_LENGTH
-#define CPPHTTPLIB_PAYLOAD_MAX_LENGTH ((std::numeric_limits<size_t>::max)())
+#define CPPHTTPLIB_PAYLOAD_MAX_LENGTH ((std::numeric_limits<uint64_t>::max)())
 #endif
 
 #ifndef CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH
@@ -1023,7 +1023,7 @@ public:
   template <class Rep, class Period>
   Server &set_idle_interval(const std::chrono::duration<Rep, Period> &duration);
 
-  Server &set_payload_max_length(size_t length);
+  Server &set_payload_max_length(uint64_t length);
 
   bool bind_to_port(const std::string &host, int port, int socket_flags = 0);
   int bind_to_any_port(const std::string &host, int socket_flags = 0);
@@ -1054,7 +1054,7 @@ protected:
   time_t write_timeout_usec_ = CPPHTTPLIB_SERVER_WRITE_TIMEOUT_USECOND;
   time_t idle_interval_sec_ = CPPHTTPLIB_IDLE_INTERVAL_SECOND;
   time_t idle_interval_usec_ = CPPHTTPLIB_IDLE_INTERVAL_USECOND;
-  size_t payload_max_length_ = CPPHTTPLIB_PAYLOAD_MAX_LENGTH;
+  uint64_t payload_max_length_ = CPPHTTPLIB_PAYLOAD_MAX_LENGTH;
 
 private:
   using Handlers =
@@ -4409,7 +4409,7 @@ bool prepare_content_receiver(T &x, int &status,
 }
 
 template <typename T>
-bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
+bool read_content(Stream &strm, T &x, uint64_t payload_max_length, int &status,
                   Progress progress, ContentReceiverWithProgress receiver,
                   bool decompress) {
   return prepare_content_receiver(
@@ -6402,7 +6402,7 @@ inline Server &Server::set_idle_interval(time_t sec, time_t usec) {
   return *this;
 }
 
-inline Server &Server::set_payload_max_length(size_t length) {
+inline Server &Server::set_payload_max_length(uint64_t length) {
   payload_max_length_ = length;
   return *this;
 }
@@ -8085,9 +8085,9 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
 
     if (res.status != StatusCode::NotModified_304) {
       int dummy_status;
-      if (!detail::read_content(strm, res, (std::numeric_limits<size_t>::max)(),
-                                dummy_status, std::move(progress),
-                                std::move(out), decompress_)) {
+      if (!detail::read_content(
+              strm, res, (std::numeric_limits<uint64_t>::max)(), dummy_status,
+              std::move(progress), std::move(out), decompress_)) {
         if (error != Error::Canceled) { error = Error::Read; }
         return false;
       }
