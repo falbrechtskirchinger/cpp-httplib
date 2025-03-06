@@ -6084,6 +6084,58 @@ TEST_F(PayloadMaxLengthTest, ExceedLimit) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
+TEST(PayloadMaxLengthTest2, LimitOn32bit) {
+  constexpr uint64_t send_size = std::numeric_limits<uint32_t>::max() + 1ull;
+
+  std::cout << "size_t size: " << std::numeric_limits<size_t>::max() << "\n";
+  std::cout << "send size: " << send_size << "\n";
+
+  Server svr;
+  char data[1024]{0};
+  svr.Get("/", [&](const Request &, Response &res) {
+    res.set_content_provider(
+        send_size, "text/plain",
+        [&](size_t /*offset*/, size_t length, DataSink &sink) {
+          std::cout << "write " << length << "\n";
+          sink.write(data, std::min(length, sizeof(data)));
+          return true;
+        });
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  uint64_t expected_size = static_cast<uint64_t>(-1);
+  uint64_t total_size = 0;
+  auto res = cli.Get(
+      "/", Headers(),
+      [&](const Response &response) {
+        EXPECT_EQ(StatusCode::OK_200, response.status);
+        std::cout << "has Content-Length: "
+                  << response.has_header("Content-Length") << "\n";
+        expected_size = response.get_header_value_u64("Content-Length", 0);
+        std::cout << "expected_size: " << expected_size << "\n";
+        EXPECT_EQ(expected_size, send_size);
+        return true;
+      },
+      [&](const char * /*data*/, size_t data_length) {
+        std::cout << "read " << data_length << "\n";
+        total_size += data_length;
+        return true;
+      });
+
+  std::cout << "total_size: " << total_size << "\n";
+
+  ASSERT_TRUE(res);
+  ASSERT_EQ(total_size, expected_size);
+}
+
 TEST(HostAndPortPropertiesTest, NoSSL) {
   httplib::Client cli("www.google.com", 1234);
   ASSERT_EQ("www.google.com", cli.host());
